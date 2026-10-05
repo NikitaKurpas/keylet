@@ -21,8 +21,31 @@ class Pathname
     File.symlink(source, self/source.basename)
   end
 end
+class PostInstallSteps
+  attr_reader :steps
+  def initialize; @steps = []; end
+  def run(command, args: [], base: nil)
+    @steps << [command, args, base]
+  end
+end
+module Kernel
+  def system(*args)
+    expected = ["/usr/bin/codesign", "--verify", "--strict", File.join(ENV.fetch("DEST"), "libexec/Keylet.app")]
+    matches = args.length == 4 && args.take(3) == expected.take(3)
+    matches &&= File.realpath(args.last) == File.realpath(expected.last)
+    raise "Unexpected native operation" unless matches
+    File.write(ENV.fetch("DEST")+"/verification-requested", "strict")
+    ENV["VERIFY_FAIL"] != "1"
+  end
+end
 class Formula
   def self.test; end
+  def self.post_install_steps(&block)
+    dsl = PostInstallSteps.new
+    dsl.instance_eval(&block)
+    @steps = dsl.steps
+  end
+  def self.steps; @steps; end
   def self.method_missing(*)
   end
   def buildpath; Pathname.new(ENV.fetch("STAGE")); end
@@ -31,14 +54,18 @@ class Formula
   def bin; Pathname.new(ENV.fetch("DEST"))/"bin"; end
   def chmod(mode, path); File.chmod(mode, path); end
   def odie(message); raise message; end
-  def system(*args)
-    raise "Unexpected native operation" unless args == ["/usr/bin/codesign", "--verify", "--strict", libexec/"Keylet.app"]
-    File.write(ENV.fetch("DEST")+"/verification-requested", "strict")
-  end
 end
 load ARGV.fetch(0)
-Keylet.new.install
-Keylet.new.post_install
+raise "Verification ran at formula load" if File.exist?(ENV.fetch("DEST")+"/verification-requested")
+formula = Keylet.new
+formula.install
+if ENV["TAMPER"] == "1"
+  File.binwrite(formula.libexec/"Keylet.app/Contents/MacOS/keylet", "changed public fixture")
+end
+raise "Unexpected post-install steps" unless Keylet.steps == [["keylet-verify-install", [], :libexec]]
+# The native runner resolves :libexec after linkage. Load this fixture helper
+# there with Kernel#system mocked, never invoking codesign or an app.
+Keylet.steps.each { |command, _, _| load (formula.libexec/command).to_s }
 '''
 
 class FormulaTests(unittest.TestCase):
@@ -71,6 +98,30 @@ class FormulaTests(unittest.TestCase):
                 result = subprocess.run(['/bin/bash', str(wrapper)], env=dict(environment, KEYLET_KEY_ID='00000000-0000-0000-0000-000000000000'), capture_output=True)
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(b'binary differs', result.stderr)
+
+    def test_post_install_rejects_changed_digest_and_failed_signature(self):
+        fixture = b'public non-executable fixture'
+        for fault in ['TAMPER', 'VERIFY_FAIL']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                stage = root/'stage'
+                binary = stage/'Contents/MacOS/keylet'
+                binary.parent.mkdir(parents=True)
+                binary.write_bytes(fixture)
+                formula = root/'keylet.rb'
+                formula.write_text(release.formula_text('v1.2.3', 'owner/repo', 'a'*64, hashlib.sha256(fixture).hexdigest()))
+                harness = root/'harness.rb'
+                harness.write_text(HARNESS)
+                destination = root/'destination with spaces'
+                result = subprocess.run(['/usr/bin/ruby', str(harness), str(formula)], cwd=stage,
+                    env=dict(os.environ, STAGE=str(stage), DEST=str(destination), **{fault:'1'}), capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                if fault == 'TAMPER':
+                    self.assertIn(b'Homebrew changed the signed Keylet binary', result.stderr)
+                    self.assertFalse((destination/'verification-requested').exists())
+                else:
+                    self.assertIn(b'Keylet signature verification failed', result.stderr)
+                    self.assertTrue((destination/'verification-requested').exists())
 
     def test_missing_staging_bundle_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

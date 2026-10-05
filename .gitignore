@@ -1,0 +1,15 @@
+.build/
+.swiftpm/
+dist/
+*.provisionprofile
+*.mobileprovision
+*.log
+.DS_Store
+
+__pycache__/
+*.pyc
+
+# Release credentials stay outside source and are supplied manually through GitHub secrets.
+*.p12
+*.p8
+*.keychain-db

@@ -154,10 +154,14 @@ class ReleaseTests(unittest.TestCase):
 
     def test_failed_signing_always_deletes_explicit_temporary_keychain(self):
         calls = []
+        active = ['/fixture/login.keychain-db']
         def command(args, **kwargs):
+            nonlocal active
             calls.append(args)
-            if args[0] == release.sys.executable: raise ValueError('Synthetic signing failure')
-            if args == ['security','list-keychains','-d','user']: return b'"/fixture/login.keychain-db"\n'
+            if args[:5] == ['security','list-keychains','-d','user','-s']:
+                active = args[5:]
+            if args == ['security','list-keychains','-d','user']:
+                return ('\n'.join('"'+name+'"' for name in active)+'\n').encode()
             return b''
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -175,6 +179,87 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(Path(created).parent.exists())
         self.assertIn(['security','list-keychains','-d','user','-s','/fixture/login.keychain-db'], calls)
         self.assertFalse(any('default-keychain' in args for args in calls))
+
+    def test_search_list_is_explicit_ordered_and_normalizes_path_aliases(self):
+        keychain = Path('/tmp/keylet-public-fixture/keychain-db')
+        previous = ['/fixture/login with spaces.keychain-db', '/fixture/other.keychain-db']
+        observed = ('\n'.join('"'+str(Path(name).resolve())+'"' for name in [str(keychain)]+previous)).encode()
+        with patch.object(release, 'run', side_effect=[b'', observed]) as mocked:
+            release.configure_keychain_search_list(keychain, previous)
+        self.assertEqual(mocked.call_args_list[0].args[0], ['security','list-keychains','-d','user','-s',str(keychain)]+previous)
+        self.assertEqual(previous, ['/fixture/login with spaces.keychain-db', '/fixture/other.keychain-db'])
+        for bad in [previous, [str(keychain)], previous+[str(keychain)]]:
+            with patch.object(release, 'run', side_effect=[b'', ('\n'.join('"'+name+'"' for name in bad)).encode()]):
+                with self.assertRaisesRegex(ValueError, 'temporary_keychain_search_list_failed'):
+                    release.configure_keychain_search_list(keychain, previous)
+        for error in [OSError('SENSITIVE_FIXTURE'), ValueError('SENSITIVE_FIXTURE')]:
+            with patch.object(release, 'run', side_effect=error):
+                with self.assertRaisesRegex(ValueError, 'temporary_keychain_search_list_failed') as caught:
+                    release.configure_keychain_search_list(keychain, previous)
+            self.assertNotIn('SENSITIVE_FIXTURE', str(caught.exception))
+
+    def test_signing_check_skips_release_and_always_attempts_cleanup(self):
+        for fault in ['none', 'signer', 'restore', 'signer-and-restore', 'create', 'readback']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                contents = root/'dist/Keylet.app/Contents'
+                contents.mkdir(parents=True)
+                original_info = plistlib.dumps({'CFBundleVersion':'unchanged fixture'})
+                (contents/'Info.plist').write_bytes(original_info)
+                calls, active = [], ['/fixture/login with spaces.keychain-db']
+                created = []
+                def command(args, **kwargs):
+                    nonlocal active
+                    calls.append(args)
+                    if args[:2] == ['security','create-keychain']:
+                        created.append(args[-1])
+                        if fault == 'create': raise ValueError('Synthetic create failure')
+                    if args[:5] == ['security','list-keychains','-d','user','-s']:
+                        if len(args) == 6 and fault in ['restore', 'signer-and-restore']:
+                            raise OSError('SENSITIVE_FIXTURE')
+                        active = args[5:]
+                    if args == ['security','list-keychains','-d','user']:
+                        values = active if fault != 'readback' or len(active) == 1 else []
+                        return ('\n'.join('"'+name+'"' for name in values)).encode()
+                    return b''
+                environment = {name:base64.b64encode(b'noncredential fixture').decode()
+                    for name in ['DEVELOPER_ID_P12_BASE64','DEVELOPER_ID_PROFILE_BASE64']}
+                environment.update(DEVELOPER_ID_P12_PASSWORD='noncredential fixture', DEVELOPER_ID_IDENTITY='A'*40, APPLE_TEAM_ID='EXAMPL1234')
+                stdout, stderr = io.StringIO(), io.StringIO()
+                side_effect = ValueError('Synthetic signing failure') if fault in ['signer','signer-and-restore'] else None
+                with patch.object(release,'ROOT',root), patch.object(release,'check_tools'), patch.object(sign_bundle,'validate_bundle'), patch.object(release,'run',side_effect=command), patch.object(release,'run_signer',side_effect=side_effect) as signer_mock, patch.object(release,'api',side_effect=AssertionError('No publication')), patch.dict(os.environ,environment,clear=True), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    if fault == 'none': release.prepare(None)
+                    else:
+                        expected = {'signer':'Synthetic signing failure', 'restore':'cleanup failed', 'signer-and-restore':'Synthetic signing failure', 'create':'Synthetic create failure', 'readback':'temporary_keychain_search_list_failed'}[fault]
+                        with self.assertRaisesRegex(ValueError, expected): release.prepare(None)
+                self.assertEqual((contents/'Info.plist').read_bytes(), original_info)
+                self.assertEqual(calls[-1], ['security','delete-keychain',created[0]])
+                self.assertIn(['security','list-keychains','-d','user','-s','/fixture/login with spaces.keychain-db'], calls)
+                self.assertFalse(Path(created[0]).parent.exists())
+                self.assertFalse(any(args[0] in ['ditto','xcrun','gh','codesign','spctl'] for args in calls))
+                self.assertNotIn('SENSITIVE_FIXTURE', stdout.getvalue()+stderr.getvalue())
+                self.assertFalse(list((root/'dist').glob('*.zip*')))
+                if fault in ['create','readback']: signer_mock.assert_not_called()
+                else:
+                    signer_mock.assert_called_once()
+                    self.assertEqual(signer_mock.call_args.args[0]['SIGNING_KEYCHAIN'], created[0])
+                    self.assertEqual(signer_mock.call_args.args[0]['SIGNING_MODE'], 'developer-id')
+                if fault == 'none': self.assertIn('Signing check passed', stdout.getvalue())
+                else: self.assertNotIn('Signing check passed', stdout.getvalue())
+
+    def test_signing_check_workflow_is_main_only_and_cannot_publish(self):
+        workflow = (release.ROOT/'.github/workflows/signing-check.yml').read_text()
+        self.assertIn('workflow_dispatch:', workflow)
+        self.assertIn("if: github.ref == 'refs/heads/main'", workflow)
+        self.assertIn('ref: ${{ github.sha }}', workflow)
+        self.assertIn('environment: release', workflow)
+        self.assertIn('contents: read', workflow)
+        self.assertIn('persist-credentials: false', workflow)
+        self.assertIn('actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683', workflow)
+        self.assertIn('python3 scripts/release.py check-signing', workflow)
+        self.assertLess(workflow.index('make test'), workflow.index('secrets.DEVELOPER_ID'))
+        for forbidden in ['contents: write','push:','pull_request','NOTARY_','TAP_TOKEN','GH_TOKEN','release.py publish','release.py tap','upload-artifact']:
+            self.assertNotIn(forbidden, workflow)
 
     def test_tap_accepts_only_this_run_artifact_and_validates_remote_bytes(self):
         repo = 'NikitaKurpas/keylet'

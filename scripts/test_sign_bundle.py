@@ -70,6 +70,34 @@ class SigningMetadataTests(unittest.TestCase):
             self.assertNotIn('SENSITIVE_FIXTURE', str(caught.exception))
             self.assertTrue(mocked.call_args.kwargs['capture_output'])
 
+    def test_codesign_categories_project_only_fixed_known_failure_phrases(self):
+        cases = [
+            (b'SENSITIVE_FIXTURE: user interaction is not allowed.', 'codesign_interaction_required'),
+            (b'Warning: unable to build chain to self-signed root for signer SENSITIVE_FIXTURE\nerrSecInternalComponent', 'codesign_certificate_chain_failed'),
+            (b'SENSITIVE_FIXTURE: CSSMERR_TP_NOT_TRUSTED', 'codesign_certificate_chain_failed'),
+            (b'SENSITIVE_FIXTURE: The timestamp service is not available.', 'codesign_timestamp_failed'),
+            (b'SENSITIVE_FIXTURE: resource fork, Finder information, or similar detritus not allowed', 'codesign_bundle_metadata_failed'),
+            (b'SENSITIVE_FIXTURE: errSecInternalComponent', 'codesign_internal_component'),
+            (b'SENSITIVE_FIXTURE: The specified item could not be found in the keychain.', 'codesign_keychain_item_missing'),
+            (b'SENSITIVE_FIXTURE certificate timestamp resource unknown', 'codesign_failed'),
+            (b'\xff errSecInternalComponent SENSITIVE_FIXTURE', 'codesign_failed'),
+            (b'errSecInternalComponent'+b'x'*(64*1024), 'codesign_failed'),
+            (None, 'codesign_failed')]
+        for stderr, code in cases:
+            self.assertEqual(signer.codesign_failure_category(stderr), code)
+            failure = subprocess.CalledProcessError(1, ['SENSITIVE_FIXTURE'], output=b'SENSITIVE_FIXTURE', stderr=stderr)
+            with patch.dict(os.environ, {'KEYLET_SIGN_DIAGNOSTICS':'exit-code-v1'}, clear=True), patch.object(signer.subprocess,'run',side_effect=failure):
+                with self.assertRaises(signer.SigningError) as caught:
+                    signer.command(['/usr/bin/codesign'], capture=False, failure_code='codesign_failed')
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn('SENSITIVE_FIXTURE', str(caught.exception))
+        failure = subprocess.CalledProcessError(1, [], stderr=b'errSecInternalComponent')
+        for environment, stage in [({}, 'codesign_failed'), ({'KEYLET_SIGN_DIAGNOSTICS':'exit-code-v1'}, 'signature_verification_failed')]:
+            with patch.dict(os.environ, environment, clear=True), patch.object(signer.subprocess,'run',side_effect=failure):
+                with self.assertRaises(signer.SigningError) as caught:
+                    signer.command(['/usr/bin/codesign'], failure_code=stage)
+            self.assertEqual(caught.exception.code, stage)
+
     def test_profile_checks_return_specific_diagnostic_codes(self):
         cases = [('TeamIdentifier', ['OTHER12345'], 'profile_team_mismatch'),
                  ('ApplicationIdentifierPrefix', ['OTHER12345'], 'profile_prefix_mismatch'),

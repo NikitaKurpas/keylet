@@ -1,0 +1,32 @@
+name: Signing check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: keylet-release
+  cancel-in-progress: false
+jobs:
+  signing-check:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    environment: release
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Credential-free tests and isolated bundle
+        run: |
+          python3 -c 'import sys; sys.path.insert(0, "scripts"); import release; release.check_tools()'
+          make test
+          make smoke
+          make bundle
+      - name: Check supplied signing identity in disposable CI checkout
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          DEVELOPER_ID_PROFILE_BASE64: ${{ secrets.DEVELOPER_ID_PROFILE_BASE64 }}
+          DEVELOPER_ID_IDENTITY: ${{ vars.DEVELOPER_ID_IDENTITY }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: python3 scripts/release.py check-signing

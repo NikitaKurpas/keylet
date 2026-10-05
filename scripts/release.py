@@ -76,61 +76,81 @@ def check_tools():
     if run(['uname', '-m']).strip() != b'arm64': raise ValueError('Release runner must be arm64')
 
 
+def configure_keychain_search_list(keychain, previous):
+    # --keychain scopes identity lookup only. Chain construction still uses the
+    # user search list; do not depend on create-keychain auto-registration.
+    expected = [str(keychain)] + previous
+    try:
+        run(['security', 'list-keychains', '-d', 'user', '-s'] + expected)
+        observed = shlex.split(run(['security', 'list-keychains', '-d', 'user']).decode())
+        if [Path(value).resolve() for value in observed] != [Path(value).resolve() for value in expected]:
+            raise ValueError('Unexpected keychain search list')
+    except (ValueError, OSError):
+        raise ValueError('Release signing setup failed [temporary_keychain_search_list_failed]') from None
+
+
 def prepare(tag):
-    release_version = version(tag)
+    release_version = version(tag) if tag is not None else None
     check_tools()
     # Tests and build run in the earlier credential-free workflow step.
     app = ROOT / 'dist/Keylet.app'
     import sign_bundle
     sign_bundle.validate_bundle(ROOT, app)
-    info_path = app / 'Contents/Info.plist'
-    info = plistlib.loads(info_path.read_bytes())
-    info['CFBundleShortVersionString'] = release_version
-    info['CFBundleVersion'] = release_version
-    info_path.write_bytes(plistlib.dumps(info))
+    if release_version is not None:
+        info_path = app / 'Contents/Info.plist'
+        info = plistlib.loads(info_path.read_bytes())
+        info['CFBundleShortVersionString'] = release_version
+        info['CFBundleVersion'] = release_version
+        info_path.write_bytes(plistlib.dumps(info))
     with tempfile.TemporaryDirectory(prefix='keylet-release-') as temporary:
         directory = Path(temporary)
         os.chmod(directory, 0o700)
         certificate = write_secret(directory, 'identity.p12', require_env('DEVELOPER_ID_P12_BASE64'))
         profile = write_secret(directory, 'release.provisionprofile', require_env('DEVELOPER_ID_PROFILE_BASE64'))
-        notary_key = write_secret(directory, 'notary.p8', require_env('NOTARY_KEY_BASE64'))
+        notary_key = write_secret(directory, 'notary.p8', require_env('NOTARY_KEY_BASE64')) if release_version is not None else None
         keychain = directory / 'release.keychain-db'
         password = secrets.token_hex(32)
         previous_search_list = shlex.split(run(['security', 'list-keychains', '-d', 'user']).decode())
-        created = False
+        creation_attempted = False
         try:
+            # Own this fresh path even if the tool fails after partial creation.
+            creation_attempted = True
             run(['security', 'create-keychain', '-p', password, str(keychain)])
-            created = True
             run(['security', 'set-keychain-settings', '-lut', '21600', str(keychain)])
             run(['security', 'unlock-keychain', '-p', password, str(keychain)])
             run(['security', 'import', str(certificate), '-k', str(keychain), '-P', require_env('DEVELOPER_ID_P12_PASSWORD'), '-T', '/usr/bin/codesign'])
             run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
+            configure_keychain_search_list(keychain, previous_search_list)
             env = dict(os.environ, PROFILE=str(profile), IDENTITY=require_env('DEVELOPER_ID_IDENTITY'),
                        TEAM_ID=require_env('APPLE_TEAM_ID'), SIGNING_MODE='developer-id', SIGNING_KEYCHAIN=str(keychain))
             run_signer(env)
-            upload = directory / 'notarization.zip'
-            run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(upload)])
-            result = json.loads(run(['xcrun', 'notarytool', 'submit', str(upload), '--key', str(notary_key),
-                '--key-id', require_env('NOTARY_KEY_ID'), '--issuer', require_env('NOTARY_ISSUER_ID'), '--wait', '--output-format', 'json']))
-            if result.get('status') != 'Accepted': raise ValueError('Notarization did not return Accepted')
-            run(['xcrun', 'stapler', 'staple', str(app)])
-            run(['xcrun', 'stapler', 'validate', str(app)])
-            run(['codesign', '--verify', '--strict', '--verbose=2', str(app)])
-            run(['spctl', '--assess', '--type', 'execute', str(app)])
+            if release_version is not None:
+                upload = directory / 'notarization.zip'
+                run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(upload)])
+                result = json.loads(run(['xcrun', 'notarytool', 'submit', str(upload), '--key', str(notary_key),
+                    '--key-id', require_env('NOTARY_KEY_ID'), '--issuer', require_env('NOTARY_ISSUER_ID'), '--wait', '--output-format', 'json']))
+                if result.get('status') != 'Accepted': raise ValueError('Notarization did not return Accepted')
+                run(['xcrun', 'stapler', 'staple', str(app)])
+                run(['xcrun', 'stapler', 'validate', str(app)])
+                run(['codesign', '--verify', '--strict', '--verbose=2', str(app)])
+                run(['spctl', '--assess', '--type', 'execute', str(app)])
         finally:
             # Some OS versions add newly created keychains to the user search list.
             # Restore the exact previous list, then delete our keychain, even after tool failure.
-            if created:
+            if creation_attempted:
                 active_error = sys.exc_info()[0] is not None
                 cleanup_failed = False
                 for arguments in [
                     ['security', 'list-keychains', '-d', 'user', '-s'] + previous_search_list,
                     ['security', 'delete-keychain', str(keychain)]]:
                     try: run(arguments)
-                    except ValueError: cleanup_failed = True
+                    except (ValueError, OSError): cleanup_failed = True
                 if cleanup_failed:
                     if not active_error: raise ValueError('Temporary keychain cleanup failed; runner must be discarded')
                     print('release: temporary keychain cleanup failed; runner must be discarded', file=sys.stderr)
+    if release_version is None:
+        print('Signing check passed; no notarization, release assets or tap update performed.')
+        return
     archive = ROOT / 'dist' / ('Keylet-' + release_version + '-arm64.zip')
     # Avoid AppleDouble files being materialized inside a sealed app by Homebrew.
     run(['ditto', '-c', '-k', '--norsrc', '--noextattr', '--noqtn', '--keepParent', str(app), str(archive)])
@@ -237,9 +257,12 @@ def update_tap(tag):
 
 if __name__ == '__main__':
     try:
-        if len(sys.argv) != 3 or sys.argv[1] not in ['prepare', 'publish', 'tap']:
-            raise ValueError('Usage: release.py prepare|publish|tap vMAJOR.MINOR.PATCH')
-        {'prepare': prepare, 'publish': publish, 'tap': update_tap}[sys.argv[1]](sys.argv[2])
+        if len(sys.argv) == 2 and sys.argv[1] == 'check-signing':
+            prepare(None)
+        else:
+            if len(sys.argv) != 3 or sys.argv[1] not in ['prepare', 'publish', 'tap']:
+                raise ValueError('Usage: release.py check-signing | prepare|publish|tap vMAJOR.MINOR.PATCH')
+            {'prepare': prepare, 'publish': publish, 'tap': update_tap}[sys.argv[1]](sys.argv[2])
     except Exception as error:
         print('release: ' + (str(error) if isinstance(error, ValueError) else 'Release operation failed; sensitive tool output withheld'), file=sys.stderr)
         sys.exit(1)

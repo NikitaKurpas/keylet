@@ -24,7 +24,8 @@ IDENTIFIER = 'me.kurpas.keylet'
 
 
 # Opt-in child/parent protocol: only these fixed numeric statuses cross the
-# release boundary. Never infer a diagnosis from credential-bearing tool output.
+# release boundary. Raw tool output stays inside the child; only fixed
+# categories from narrow known signing-error phrases may cross that boundary.
 SIGNING_EXIT_CODES = {
     'invalid_inputs': 64,
     'unknown_signing_mode': 65,
@@ -56,6 +57,13 @@ SIGNING_EXIT_CODES = {
     'command_failed': 91,
     'signing_input_read_or_parse_failed': 92,
     'signing_unexpected_failure': 93,
+    'codesign_interaction_required': 94,
+    'codesign_certificate_chain_failed': 95,
+    'codesign_timestamp_failed': 96,
+    'codesign_bundle_metadata_failed': 97,
+    'codesign_internal_component': 98,
+    'codesign_keychain_item_missing': 99,
+
 }
 
 
@@ -155,10 +163,32 @@ def generated_entitlements(template, team):
     return result
 
 
+def codesign_failure_category(stderr):
+    # These are diagnostic hints, never authorization decisions or retry rules.
+    # Do not project paths, certificate names, raw lines, or arbitrary tokens.
+    if not isinstance(stderr, bytes) or len(stderr) > 64 * 1024:
+        return 'codesign_failed'
+    try: text = stderr.decode('utf-8').lower()
+    except UnicodeDecodeError: return 'codesign_failed'
+    phrases = [
+        ('codesign_certificate_chain_failed', ('unable to build chain to self-signed root', 'cssmerr_tp_not_trusted')),
+        ('codesign_interaction_required', ('user interaction is not allowed',)),
+        ('codesign_timestamp_failed', ('the timestamp service is not available', 'a timestamp was expected but was not found')),
+        ('codesign_bundle_metadata_failed', ('resource fork, finder information, or similar detritus not allowed',)),
+        ('codesign_keychain_item_missing', ('the specified item could not be found in the keychain',)),
+        ('codesign_internal_component', ('errsecinternalcomponent',)),
+    ]
+    for code, fragments in phrases:
+        if any(fragment in text for fragment in fragments): return code
+    return 'codesign_failed'
+
+
 def command(arguments, *, capture=True, failure_code='command_failed'):
     try:
         return subprocess.run(arguments, check=True, capture_output=capture or diagnostic_mode(os.environ)).stdout
-    except (subprocess.CalledProcessError, OSError):
+    except (subprocess.CalledProcessError, OSError) as error:
+        if diagnostic_mode(os.environ) and failure_code == 'codesign_failed' and isinstance(error, subprocess.CalledProcessError):
+            failure_code = codesign_failure_category(error.stderr)
         raise SigningError(failure_code, 'Signing tool failed; verify its inputs and authorization') from None
 
 

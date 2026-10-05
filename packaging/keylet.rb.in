@@ -77,5 +77,11 @@ class Keylet < Formula
 
   test do
     assert_match "Keylet", shell_output("#{bin}/keylet --help")
+  rescue Minitest::Assertion
+    # Capture before logging can replace the status; preserve the failed test.
+    status = $CHILD_STATUS
+    opoo "Keylet test subprocess: exitstatus=#{status&.exitstatus.inspect}, " \
+         "termsig=#{status&.termsig.inspect}, signaled=#{status&.signaled?.inspect}"
+    raise
   end
 end

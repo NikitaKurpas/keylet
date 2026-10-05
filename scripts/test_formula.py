@@ -99,6 +99,48 @@ class FormulaTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(b'binary differs', result.stderr)
 
+    def test_launch_diagnostic_reports_signal_and_preserves_assertion(self):
+        # Execute only the formula test block with a synthetic Ruby subprocess.
+        # Neither the installed app nor any formula installation step is run.
+        harness = r"""
+require "english"
+require "pathname"
+require "rbconfig"
+module Minitest; class Assertion < StandardError; end; end
+class Formula
+  def self.method_missing(*); end
+  def self.test(&block); define_method(:test, &block); end
+  def bin; Pathname("/public-fixture/bin"); end
+  def shell_output(*)
+    code = ENV.fetch("FAULT") == "signal" ? 'Process.kill("TERM", Process.pid)' : 'exit 7'
+    Process.wait(Process.spawn(RbConfig.ruby, "-e", code))
+    raise Minitest::Assertion, "original assertion"
+  end
+  def opoo(message); puts message; end
+end
+load ARGV.fetch(0)
+begin
+  Keylet.new.test
+rescue Minitest::Assertion => error
+  warn error.message
+  exit 1
+end
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            formula = root/'keylet.rb'
+            formula.write_text(release.formula_text('v1.2.3', 'owner/repo', 'a'*64, 'b'*64))
+            script = root/'diagnostic.rb'
+            script.write_text(harness)
+            for fault, expected in [('signal', 'exitstatus=nil, termsig=15, signaled=true'),
+                                    ('exit', 'exitstatus=7, termsig=nil, signaled=false')]:
+                with self.subTest(fault=fault):
+                    result = subprocess.run(['/usr/bin/ruby', str(script), str(formula)],
+                        env=dict(os.environ, FAULT=fault), capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(expected, result.stdout)
+                    self.assertEqual(result.stderr.strip(), 'original assertion')
+
     def test_post_install_rejects_changed_digest_and_failed_signature(self):
         fixture = b'public non-executable fixture'
         for fault in ['TAMPER', 'VERIFY_FAIL']:

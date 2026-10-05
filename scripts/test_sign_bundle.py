@@ -1,5 +1,8 @@
 """Synthetic public profile metadata only; importing the helper never runs main/signing."""
 import copy
+import contextlib
+import io
+import subprocess
 import datetime as dt
 import hashlib
 import plistlib
@@ -33,6 +36,54 @@ class SigningMetadataTests(unittest.TestCase):
     def validate(self, profile=None):
         signer.validate_profile(self.profile if profile is None else profile,
             team=TEAM, identity=IDENTITY, device_ids={'THIS-MAC'}, now=NOW)
+
+    def test_diagnostic_statuses_are_unique_and_fixed(self):
+        values = list(signer.SIGNING_EXIT_CODES.values())
+        self.assertEqual(len(values), len(set(values)))
+        self.assertTrue(all(64 <= value < 126 for value in values))
+        for code in signer.SIGNING_EXIT_CODES:
+            stderr = io.StringIO()
+            with patch.dict(os.environ, {'KEYLET_SIGN_DIAGNOSTICS':'exit-code-v1'}, clear=True), patch.object(signer, 'main', side_effect=signer.SigningError(code, 'SENSITIVE_FIXTURE')), contextlib.redirect_stderr(stderr):
+                self.assertEqual(signer.cli(), signer.SIGNING_EXIT_CODES[code])
+            self.assertEqual(stderr.getvalue(), 'sign: '+code+'\n')
+
+    def test_diagnostic_untyped_errors_withhold_messages_and_local_exit_stays_one(self):
+        for error in [ValueError('SENSITIVE_FIXTURE'), OSError('SENSITIVE_FIXTURE'), TypeError('SENSITIVE_FIXTURE'), RuntimeError('SENSITIVE_FIXTURE')]:
+            stderr = io.StringIO()
+            code = 'signing_unexpected_failure' if isinstance(error, RuntimeError) else 'signing_input_read_or_parse_failed'
+            with patch.dict(os.environ, {'KEYLET_SIGN_DIAGNOSTICS':'exit-code-v1'}, clear=True), patch.object(signer, 'main', side_effect=error), contextlib.redirect_stderr(stderr):
+                self.assertEqual(signer.cli(), signer.SIGNING_EXIT_CODES[code])
+            self.assertEqual(stderr.getvalue(), 'sign: '+code+'\n')
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch.object(signer, 'main', side_effect=signer.SigningError('profile_expired', 'Public local guidance')), contextlib.redirect_stderr(stderr):
+            self.assertEqual(signer.cli(), 1)
+        self.assertEqual(stderr.getvalue(), 'sign: Public local guidance\n')
+        with patch.dict(os.environ, {}, clear=True), patch.object(signer, 'main', side_effect=RuntimeError('Public unexpected fixture')):
+            with self.assertRaises(RuntimeError): signer.cli()
+
+    def test_diagnostic_commands_capture_raw_output_and_keep_only_named_stage(self):
+        failure = subprocess.CalledProcessError(1, ['SENSITIVE_FIXTURE'], output=b'SENSITIVE_FIXTURE', stderr=b'SENSITIVE_FIXTURE')
+        with patch.dict(os.environ, {'KEYLET_SIGN_DIAGNOSTICS':'exit-code-v1'}, clear=True), patch.object(signer.subprocess, 'run', side_effect=failure) as mocked:
+            with self.assertRaises(signer.SigningError) as caught:
+                signer.command(['SENSITIVE_FIXTURE'], capture=False, failure_code='codesign_failed')
+            self.assertEqual(caught.exception.code, 'codesign_failed')
+            self.assertNotIn('SENSITIVE_FIXTURE', str(caught.exception))
+            self.assertTrue(mocked.call_args.kwargs['capture_output'])
+
+    def test_profile_checks_return_specific_diagnostic_codes(self):
+        cases = [('TeamIdentifier', ['OTHER12345'], 'profile_team_mismatch'),
+                 ('ApplicationIdentifierPrefix', ['OTHER12345'], 'profile_prefix_mismatch'),
+                 ('DeveloperCertificates', [], 'profile_certificate_missing'),
+                 ('ExpirationDate', NOW, 'profile_expired')]
+        for field, value, code in cases:
+            profile = copy.deepcopy(self.profile)
+            profile[field] = value
+            with self.assertRaises(signer.SigningError) as caught: self.validate(profile)
+            self.assertEqual(caught.exception.code, code)
+        profile = copy.deepcopy(self.profile)
+        profile['Entitlements']['com.apple.security.hardened-process.enhanced-security-version-string'] = '1'
+        with self.assertRaises(signer.SigningError) as caught: self.validate(profile)
+        self.assertEqual(caught.exception.code, 'profile_enhanced_security_missing')
 
     def test_valid_metadata_without_commands(self):
         self.validate()

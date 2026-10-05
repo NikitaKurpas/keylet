@@ -36,6 +36,22 @@ def run(args, *, env=None, capture=True):
     return result.stdout or b''
 
 
+def run_signer(environment):
+    import sign_bundle
+    # Invoke only our checked-out helper. Consume its exit status, never stdout,
+    # stderr, exception text, argv, profile contents or signing-identity values.
+    child_env = dict(environment, KEYLET_SIGN_DIAGNOSTICS='exit-code-v1')
+    try:
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/sign_bundle.py')],
+            env=child_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    except OSError:
+        raise ValueError('Release signing failed [signing_child_launch_failed]') from None
+    if result.returncode:
+        statuses = {value: code for code, value in sign_bundle.SIGNING_EXIT_CODES.items()}
+        code = statuses.get(result.returncode, 'signing_child_unclassified_failure')
+        raise ValueError('Release signing failed [' + code + ']')
+
+
 def require_env(name):
     value = os.environ.get(name, '')
     if not value: raise ValueError('Missing release input: ' + name)
@@ -91,7 +107,7 @@ def prepare(tag):
             run(['security', 'set-key-partition-list', '-S', 'apple-tool:,apple:,codesign:', '-s', '-k', password, str(keychain)])
             env = dict(os.environ, PROFILE=str(profile), IDENTITY=require_env('DEVELOPER_ID_IDENTITY'),
                        TEAM_ID=require_env('APPLE_TEAM_ID'), SIGNING_MODE='developer-id', SIGNING_KEYCHAIN=str(keychain))
-            run([sys.executable, str(ROOT / 'scripts/sign_bundle.py')], env=env)
+            run_signer(env)
             upload = directory / 'notarization.zip'
             run(['ditto', '-c', '-k', '--sequesterRsrc', '--keepParent', str(app), str(upload)])
             result = json.loads(run(['xcrun', 'notarytool', 'submit', str(upload), '--key', str(notary_key),

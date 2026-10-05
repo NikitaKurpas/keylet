@@ -1,5 +1,7 @@
 """Release validation with synthetic public data; all external commands forbidden."""
 import base64
+import contextlib
+from types import SimpleNamespace
 import datetime as dt
 import hashlib
 import os
@@ -22,6 +24,29 @@ class ReleaseTests(unittest.TestCase):
         self.no_network = patch.object(release.urllib.request, 'urlopen', side_effect=AssertionError('Network forbidden'))
         self.no_network.start()
         self.addCleanup(self.no_network.stop)
+
+    def test_signer_failure_uses_status_only_and_never_tool_output(self):
+        for code, status in list(sign_bundle.SIGNING_EXIT_CODES.items()) + [('signing_child_unclassified_failure', 1), ('signing_child_unclassified_failure', -9), ('signing_child_unclassified_failure', 255)]:
+            stdout, stderr = io.StringIO(), io.StringIO()
+            child = SimpleNamespace(returncode=status, stdout=b'SENSITIVE_FIXTURE', stderr=b'sign: codesign_failed SENSITIVE_FIXTURE')
+            with patch.object(release.subprocess, 'run', return_value=child) as mocked, contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(ValueError, r'\['+code+r'\]') as caught:
+                    release.run_signer({'KEYLET_SIGN_DIAGNOSTICS':'ignored', 'PROFILE':'SENSITIVE_FIXTURE'})
+            self.assertEqual(str(caught.exception), 'Release signing failed ['+code+']')
+            self.assertEqual(stdout.getvalue()+stderr.getvalue(), '')
+            self.assertEqual(mocked.call_args.kwargs['env']['KEYLET_SIGN_DIAGNOSTICS'], 'exit-code-v1')
+            self.assertEqual(mocked.call_args.kwargs['stdout'], release.subprocess.PIPE)
+            self.assertEqual(mocked.call_args.kwargs['stderr'], release.subprocess.PIPE)
+            self.assertEqual(mocked.call_args.args[0], [release.sys.executable, str(release.ROOT/'scripts/sign_bundle.py')])
+
+    def test_signer_success_and_spawn_failure_do_not_forward_output(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(release.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'SENSITIVE_FIXTURE', stderr=b'SENSITIVE_FIXTURE')), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertIsNone(release.run_signer({}))
+        self.assertEqual(stdout.getvalue()+stderr.getvalue(), '')
+        with patch.object(release.subprocess, 'run', side_effect=OSError('SENSITIVE_FIXTURE')):
+            with self.assertRaisesRegex(ValueError, r'\[signing_child_launch_failed\]') as caught: release.run_signer({})
+        self.assertNotIn('SENSITIVE_FIXTURE', str(caught.exception))
 
     def test_versions_reject_shell_and_nonrelease_refs(self):
         self.assertEqual(release.version('v1.2.3'), '1.2.3')
@@ -142,7 +167,7 @@ class ReleaseTests(unittest.TestCase):
             environment = {name:base64.b64encode(b'noncredential fixture').decode()
                 for name in ['DEVELOPER_ID_P12_BASE64','DEVELOPER_ID_PROFILE_BASE64','NOTARY_KEY_BASE64']}
             environment.update(DEVELOPER_ID_P12_PASSWORD='noncredential fixture', DEVELOPER_ID_IDENTITY='A'*40, APPLE_TEAM_ID='EXAMPL1234')
-            with patch.object(release,'ROOT',root), patch.object(release,'check_tools'), patch.object(sign_bundle,'validate_bundle'), patch.object(release,'run',side_effect=command), patch.dict(os.environ,environment,clear=True):
+            with patch.object(release,'ROOT',root), patch.object(release,'check_tools'), patch.object(sign_bundle,'validate_bundle'), patch.object(release,'run',side_effect=command), patch.object(release,'run_signer',side_effect=ValueError('Synthetic signing failure')), patch.dict(os.environ,environment,clear=True):
                 with self.assertRaisesRegex(ValueError,'Synthetic signing failure'): release.prepare('v1.2.3')
         self.assertEqual(calls[-1][:2], ['security','delete-keychain'])
         created = next(args[-1] for args in calls if args[:2] == ['security','create-keychain'])

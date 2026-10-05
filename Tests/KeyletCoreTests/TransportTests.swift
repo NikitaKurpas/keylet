@@ -25,6 +25,38 @@ final class Pair: @unchecked Sendable {
     guard n == data.count else { throw AgentError.io(errno) }
   }
 }
+private final class FragmentedWriter: @unchecked Sendable {
+  private let ready = DispatchSemaphore(value: 0)
+  private let done = DispatchSemaphore(value: 0)
+  private let lock = NSLock()
+  private var failure: (any Error)?
+
+  func start(pair: Pair, frame: Data) throws {
+    Thread {
+      self.ready.signal()
+      defer { self.done.signal() }
+      do {
+        for byte in frame {
+          try pair.send(Data([byte]))
+          usleep(1000)
+        }
+      } catch {
+        self.lock.lock()
+        self.failure = error
+        self.lock.unlock()
+      }
+    }.start()
+    guard ready.wait(timeout: .now() + 1) == .success else { throw AgentError.unavailable }
+  }
+
+  func wait() throws {
+    guard done.wait(timeout: .now() + 1) == .success else { throw AgentError.unavailable }
+    lock.lock()
+    let error = failure
+    lock.unlock()
+    if let error { throw error }
+  }
+}
 @Test func coalescedFramesRemainDistinct() throws {
   let pair = try Pair()
   try pair.send(SSHWire.string(Data([11])) + SSHWire.string(Data([17])))
@@ -35,18 +67,15 @@ final class Pair: @unchecked Sendable {
 @Test func fragmentedHeaderAndPayload() throws {
   let pair = try Pair()
   let frame = SSHWire.string(Data([11, 1, 2, 3]))
-  let done = DispatchSemaphore(value: 0)
-  DispatchQueue.global().async {
-    defer { done.signal() }
-    for byte in frame {
-      try? pair.send(Data([byte]))
-      usleep(1000)
-    }
-  }
-  #expect(
+  // Swift Testing can occupy the global dispatch executor with blocking tests.
+  // Use a dedicated producer thread and propagate its errors after joining it.
+  let writer = FragmentedWriter()
+  try writer.start(pair: pair, frame: frame)
+  let response = Result {
     try SocketIO.readFrame(pair.reader, deadline: ProcessInfo.processInfo.systemUptime + 1)
-      == Data([11, 1, 2, 3]))
-  #expect(done.wait(timeout: .now() + 1) == .success)
+  }
+  try writer.wait()
+  #expect(try response.get() == Data([11, 1, 2, 3]))
 }
 @Test func zeroAndOversizedFramesRejected() throws {
   for size in [UInt32(0), UInt32(SSHWire.maximumFrame + 1), UInt32.max] {

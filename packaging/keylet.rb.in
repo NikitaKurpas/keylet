@@ -29,7 +29,7 @@ class Keylet < Formula
       set -euo pipefail
       key="${KEYLET_KEY_ID:-}"
       if ! [[ "$key" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-        echo "Set KEYLET_KEY_ID to an existing Keylet UUID in ~/.homebrew/services/keylet.env, then restart the service." >&2
+        echo "Set KEYLET_KEY_ID to an existing Keylet UUID in Homebrew's user services/keylet.env, then restart the service." >&2
         exit 1
       fi
       app=#{(opt_libexec/"Keylet.app").to_s.shellescape}
@@ -64,7 +64,9 @@ class Keylet < Formula
     <<~EOS
       Requires Apple Silicon and macOS 26.4 or newer. No key is created by installation.
       To start an approved existing key at user login, set KEYLET_KEY_ID=<uuid> in
-      ~/.homebrew/services/keylet.env, then run brew services start keylet without sudo.
+      $XDG_CONFIG_HOME/homebrew/services/keylet.env when XDG_CONFIG_HOME is set;
+      otherwise use $HOMEBREW_XDG_CONFIG_HOME/homebrew/services/keylet.env if set,
+      or ~/.homebrew/services/keylet.env. Then run brew services start keylet without sudo.
       Stop the service before upgrades and restart it afterward. Keep the app bundle intact.
     EOS
   end

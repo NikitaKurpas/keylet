@@ -162,24 +162,22 @@ func exchange(_ request: Data, pair: Pair, sessions: SocketSessions, reply: (Dat
   let pair = try Pair()
   try attach(pair, to: sessions)
   let frame = SSHWire.string(Data([11, 1, 2, 3]))
-  let done = DispatchSemaphore(value: 0)
-  DispatchQueue.global().async {
-    defer { done.signal() }
-    for byte in frame {
-      try? pair.send(Data([byte]))
-      usleep(1000)
-    }
-  }
   var seen: [Data] = []
-  let end = ProcessInfo.processInfo.systemUptime + 1
-  while seen.isEmpty && ProcessInfo.processInfo.systemUptime < end {
-    try sessions.step(waitMilliseconds: 1) {
+  // Consume each byte before supplying the next. This proves partial headers
+  // and payloads survive separate event-loop steps without a scheduled producer.
+  for (index, byte) in frame.enumerated() {
+    try pair.send(Data([byte]))
+    try sessions.step(waitMilliseconds: 0) {
       seen.append($0)
       return Data([12])
     }
+    if index < frame.count - 1 { #expect(seen.isEmpty) }
   }
-  for _ in 0..<3 { try sessions.step(waitMilliseconds: 0) { _ in Data([5]) } }
-  #expect(done.wait(timeout: .now() + 1) == .success)
+  // The complete payload schedules a response; the next step writes it.
+  try sessions.step(waitMilliseconds: 0) { _ in
+    Issue.record("Unexpected additional request")
+    return Data([5])
+  }
   #expect(seen == [Data([11, 1, 2, 3])])
   #expect(
     try SocketIO.readFrame(pair.writer, deadline: ProcessInfo.processInfo.systemUptime + 1)

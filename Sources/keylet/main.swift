@@ -57,10 +57,9 @@ let invocation = CLIInvocation(Array(CommandLine.arguments.dropFirst()))
 let jsonRequested = invocation.jsonRequested
 
 /// Writes a result object in the selected text or JSON format.
-func output(_ data: [String: Any]) throws {
-  if jsonRequested {
-    let encoded = try JSONSerialization.data(withJSONObject: data, options: [.sortedKeys])
-    print(String(decoding: encoded, as: UTF8.self))
+func output(_ data: [String: Any], prettyJSON: Bool = false) throws {
+  if jsonRequested || prettyJSON {
+    print(try CLIOutput.json(data))
   } else {
     for key in data.keys.sorted() { print("\(key): \(data[key]!)") }
   }
@@ -286,9 +285,10 @@ struct Audit: ParsableCommand {
       } else {
         cursor = NSNull()
       }
-      try output([
-        "ok": true, "events": try encodedObject(events), "limit": limit, "next_before": cursor,
-      ])
+      try output(
+        [
+          "ok": true, "events": try encodedObject(events), "limit": limit, "next_before": cursor,
+        ], prettyJSON: true)
     }
   }
 
@@ -301,10 +301,11 @@ struct Audit: ParsableCommand {
     }
 
     mutating func run() throws {
-      try output([
-        "ok": true, "keys": try encodedObject(AuditStore(readOnly: true).top(limit: limit)),
-        "limit": limit,
-      ])
+      try output(
+        [
+          "ok": true, "keys": try encodedObject(AuditStore(readOnly: true).top(limit: limit)),
+          "limit": limit,
+        ], prettyJSON: true)
     }
   }
 }

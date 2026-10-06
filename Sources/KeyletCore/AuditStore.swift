@@ -4,32 +4,15 @@ import Foundation
 
 public enum AuditError: Error { case unsafePath, unavailable, invalidLimit, unsupportedSchema }
 
-/// Kernel credentials at connection time; inherited descriptors and PID reuse prevent later attribution.
-public struct AuditPeer: Codable, Equatable, Sendable {
-  public let uid: UInt32?
-  public let gid: UInt32?
-  public let pid: Int32?
-  public init(uid: UInt32? = nil, gid: UInt32? = nil, pid: Int32? = nil) {
-    self.uid = uid
-    self.gid = gid
-    self.pid = pid
-  }
-}
-
 /// One retained request outcome containing public identifiers and bounded metadata.
 public struct AuditEvent: Codable, Sendable {
   public let id: Int64
   public let timestamp: String
-  public let requestID: String
   public let action: String
   public let outcome: String
   public let keyID: String?
   public let fingerprint: String?
   public let byteCount: Int?
-  public let peerUID: UInt32?
-  public let peerGID: UInt32?
-  public let peerPID: Int32?
-  public let peerIdentity: String
   public let errorCode: String?
 }
 
@@ -106,7 +89,9 @@ public final class AuditStore: @unchecked Sendable {
     try validateFiles()
     try openDatabase(flags: SQLITE_OPEN_READONLY)
     try execute("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON")
-    guard try scalar("PRAGMA user_version") == 1 else { throw AuditError.unsupportedSchema }
+    guard [1, 2].contains(try scalar("PRAGMA user_version")) else {
+      throw AuditError.unsupportedSchema
+    }
     try validateFiles()
   }
 
@@ -146,21 +131,41 @@ public final class AuditStore: @unchecked Sendable {
   }
 
   private func initializeSchema() throws {
-    let version = try scalar("PRAGMA user_version")
-    guard version == 0 || version == 1 else { throw AuditError.unsupportedSchema }
     try transaction {
-      try execute(
-        """
-        CREATE TABLE IF NOT EXISTS events (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
-          request_id TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL,
-          key_id TEXT, fingerprint TEXT, byte_count INTEGER,
-          peer_uid INTEGER, peer_gid INTEGER, peer_pid INTEGER, peer_identity TEXT NOT NULL,
-          error_code TEXT);
-        CREATE INDEX IF NOT EXISTS events_key_outcome ON events(key_id, outcome, id);
-        PRAGMA user_version=1;
-        """)
+      let version = try scalar("PRAGMA user_version")
+      guard (0...2).contains(version) else { throw AuditError.unsupportedSchema }
+      guard try scalar("SELECT COUNT(*) FROM sqlite_master WHERE type IN ('trigger','view')") == 0
+      else { throw AuditError.unavailable }
+      if version == 0 {
+        guard try scalar("SELECT COUNT(*) FROM sqlite_master WHERE name='events'") == 0 else {
+          throw AuditError.unsupportedSchema
+        }
+        try execute(
+          """
+          CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+            action TEXT NOT NULL, outcome TEXT NOT NULL,
+            key_id TEXT, fingerprint TEXT, byte_count INTEGER, error_code TEXT);
+          CREATE INDEX events_key_outcome ON events(key_id, outcome, id);
+          """)
+      } else if version == 1 {
+        // DROP COLUMN preserves event IDs, the index and AUTOINCREMENT's high-water mark.
+        for column in ["request_id", "peer_uid", "peer_gid", "peer_pid", "peer_identity"] {
+          try execute("ALTER TABLE events DROP COLUMN \(column)")
+        }
+      }
+      try prune()
+      try execute("PRAGMA user_version=2")
     }
+  }
+
+  private func prune() throws {
+    try execute(
+      """
+      DELETE FROM events WHERE id NOT IN (
+        SELECT id FROM events ORDER BY id DESC LIMIT \(retentionLimit)
+      )
+      """)
   }
 
   /// Rolls back failed writes while preserving the original error.
@@ -261,9 +266,9 @@ public final class AuditStore: @unchecked Sendable {
   /// Commits a bounded metadata event durably and returns its retained row ID.
   @discardableResult
   public func append(
-    requestID: UUID, action: String, outcome: String, keyID: UUID? = nil,
+    action: String, outcome: String, keyID: UUID? = nil,
     fingerprint: String? = nil, byteCount: Int? = nil,
-    peer: AuditPeer = AuditPeer(), errorCode: String? = nil
+    errorCode: String? = nil
   ) throws -> Int64 {
     guard !readOnly else { throw AuditError.unavailable }
     // Only fixed enums and public key identifiers enter the DB. Never persist request data.
@@ -284,51 +289,36 @@ public final class AuditStore: @unchecked Sendable {
       let statement = try prepare(
         """
         INSERT INTO events(
-          timestamp, request_id, action, outcome, key_id, fingerprint, byte_count,
-          peer_uid, peer_gid, peer_pid, peer_identity, error_code
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+          timestamp, action, outcome, key_id, fingerprint, byte_count, error_code
+        ) VALUES(?,?,?,?,?,?,?)
         """
       )
       defer { sqlite3_finalize(statement) }
       try bind(ISO8601DateFormatter().string(from: Date()), 1, statement)
-      try bind(requestID.uuidString, 2, statement)
-      try bind(action, 3, statement)
-      try bind(outcome, 4, statement)
-      try bind(keyID?.uuidString, 5, statement)
-      try bind(fingerprint, 6, statement)
-      try bind(byteCount.map(Int64.init), 7, statement)
-      try bind(peer.uid.map(Int64.init), 8, statement)
-      try bind(peer.gid.map(Int64.init), 9, statement)
-      try bind(peer.pid.map(Int64.init), 10, statement)
-      try bind(
-        peer.uid == nil ? "unavailable" : "kernel-peer-at-connect;process-unverified", 11, statement
-      )
-      try bind(errorCode, 12, statement)
+      try bind(action, 2, statement)
+      try bind(outcome, 3, statement)
+      try bind(keyID?.uuidString, 4, statement)
+      try bind(fingerprint, 5, statement)
+      try bind(byteCount.map(Int64.init), 6, statement)
+      try bind(errorCode, 7, statement)
       guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
         throw AuditError.unavailable
       }
       let id = sqlite3_last_insert_rowid(db)
-      try execute(
-        """
-        DELETE FROM events WHERE id NOT IN (
-          SELECT id FROM events ORDER BY id DESC LIMIT \(retentionLimit)
-        )
-        """
-      )
-      try verifyInsertedEvent(id: id, requestID: requestID, outcome: outcome)
+      try prune()
+      try verifyInsertedEvent(id: id, outcome: outcome)
       try validateFiles()
       return id
     }
   }
 
   /// Detects suppressed or rewritten inserts before allowing a signing attempt to proceed.
-  private func verifyInsertedEvent(id: Int64, requestID: UUID, outcome: String) throws {
+  private func verifyInsertedEvent(id: Int64, outcome: String) throws {
     let statement = try prepare(
-      "SELECT COUNT(*) FROM events WHERE id=? AND request_id=? AND outcome=?")
+      "SELECT COUNT(*) FROM events WHERE id=? AND outcome=?")
     defer { sqlite3_finalize(statement) }
     try bind(id, 1, statement)
-    try bind(requestID.uuidString, 2, statement)
-    try bind(outcome, 3, statement)
+    try bind(outcome, 2, statement)
     guard sqlite3_step(statement) == SQLITE_ROW,
       sqlite3_column_int64(statement, 0) == 1
     else { throw AuditError.unavailable }
@@ -374,8 +364,7 @@ public final class AuditStore: @unchecked Sendable {
     try validateFiles()
     let statement = try prepare(
       """
-      SELECT id, timestamp, request_id, action, outcome, key_id, fingerprint, byte_count,
-             peer_uid, peer_gid, peer_pid, peer_identity, error_code
+      SELECT id, timestamp, action, outcome, key_id, fingerprint, byte_count, error_code
       FROM events WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?
       """
     )
@@ -391,14 +380,9 @@ public final class AuditStore: @unchecked Sendable {
   private func readEvent(_ statement: OpaquePointer) throws -> AuditEvent {
     try AuditEvent(
       id: sqlite3_column_int64(statement, 0), timestamp: requiredText(statement, 1),
-      requestID: requiredText(statement, 2), action: requiredText(statement, 3),
-      outcome: requiredText(statement, 4),
-      keyID: optionalText(statement, 5), fingerprint: optionalText(statement, 6),
-      byteCount: integer(statement, 7).map(Int.init),
-      peerUID: integer(statement, 8).flatMap(UInt32.init(exactly:)),
-      peerGID: integer(statement, 9).flatMap(UInt32.init(exactly:)),
-      peerPID: integer(statement, 10).flatMap(Int32.init(exactly:)),
-      peerIdentity: requiredText(statement, 11), errorCode: optionalText(statement, 12))
+      action: requiredText(statement, 2), outcome: requiredText(statement, 3),
+      keyID: optionalText(statement, 4), fingerprint: optionalText(statement, 5),
+      byteCount: integer(statement, 6).map(Int.init), errorCode: optionalText(statement, 7))
   }
 
   /// Counts successful signatures, not requests or signing intents; limited to retained events.

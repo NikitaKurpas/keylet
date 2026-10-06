@@ -66,6 +66,18 @@ brew services start keylet
 
 The service serves all unattended keys. To run in the foreground, use `keylet agent`; restrict it to one key with `keylet agent --key KEY_UUID`.
 
+### Delete a key
+
+List keys to find the UUID, preview deletion, then repeat the UUID to confirm:
+
+```sh
+keylet keys list
+keylet keys delete --id KEY_UUID --dry-run
+keylet keys delete --id KEY_UUID --confirm-id KEY_UUID
+```
+
+Deletion is permanent; Secure Enclave keys cannot be backed up or restored. A signature already in progress may finish. Remove the public key from remote accounts separately; restart older agents that cache keys.
+
 ### GitHub
 
 Add the public key to your GitHub account for both SSH authentication and commit signing.

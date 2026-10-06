@@ -140,8 +140,8 @@ struct Doctor: ParsableCommand {
 
 struct Keys: ParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Inspect or create dedicated keys; no private-key export.",
-    subcommands: [List.self, Resolve.self, Public.self, Create.self])
+    abstract: "Inspect, create or delete dedicated keys; no private-key export.",
+    subcommands: [List.self, Resolve.self, Public.self, Create.self, Delete.self])
   struct List: ParsableCommand {
     static let configuration = CommandConfiguration(
       abstract: "Public inventory and protection-class completeness.")
@@ -176,6 +176,41 @@ struct Keys: ParsableCommand {
       } else {
         print(try record.openSSH())
       }
+    }
+  }
+
+  struct Delete: ParsableCommand {
+    static let warning =
+      "Deletion is permanent: Secure Enclave keys cannot be exported or restored. A signature already in progress may finish; restart any older agent that caches keys and remove remote public-key authorizations separately."
+    static let configuration = CommandConfiguration(
+      abstract: "Permanently delete one exact UUID; preview with --dry-run first.",
+      discussion: warning)
+    @Option(help: "Exact key UUID; labels and prefixes are not accepted.") var id: String
+    @Option(help: "Repeat the UUID to acknowledge permanent deletion (required without --dry-run).")
+    var confirmId: String?
+    @Flag(help: "Resolve public metadata without deleting; requires signed Keychain read access.")
+    var dryRun = false
+
+    func validate() throws {
+      let target = try validatedUUID(id)
+      if let confirmId {
+        guard try validatedUUID(confirmId) == target else { throw AgentError.invalidArguments }
+      } else if !dryRun {
+        throw AgentError.invalidArguments
+      }
+    }
+
+    mutating func run() throws {
+      let store = KeyStore(context: try SigningContext.current())
+      let target = try validatedUUID(id)
+      let record =
+        dryRun
+        ? try KeyStore.deletionTarget(id: target, inventory: store.inventory())
+        : try store.delete(id: target)
+      try output([
+        "ok": true, "dry_run": dryRun, "key_deleted": !dryRun,
+        "key": try recordJSON(record), "warning": Self.warning,
+      ])
     }
   }
 
@@ -325,6 +360,15 @@ private func errorDetails(for error: Error, isParsing: Bool) -> CLIErrorDetails 
     return CLIErrorDetails(
       code: "invalid_arguments",
       message: "Missing or invalid arguments; use the subcommand's --help")
+  case KeyDeletionError.incompleteInventory:
+    return CLIErrorDetails(
+      code: "key_inventory_incomplete",
+      message: "Deletion refused: unlock and obtain a complete keys list before retrying")
+  case KeyDeletionError.notFound:
+    return CLIErrorDetails(code: "key_not_found", message: "No key matches the exact UUID")
+  case KeyDeletionError.ambiguous:
+    return CLIErrorDetails(
+      code: "key_ambiguous", message: "Deletion refused: multiple keys match the UUID")
   case AgentError.signingSetup:
     return CLIErrorDetails(
       code: "signing_setup_required",

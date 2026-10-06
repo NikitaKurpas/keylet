@@ -43,6 +43,10 @@ public struct KeychainFailure: Error {
   public init(_ status: OSStatus) { self.status = status }
 }
 
+public enum KeyDeletionError: Error {
+  case incompleteInventory, notFound, ambiguous
+}
+
 /// Public keys plus protection classes that could not be read.
 public struct Inventory: Sendable {
   public let keys: [KeyRecord]
@@ -193,6 +197,39 @@ public final class KeyStore {
     attributes[kSecAttrGeneric] = try JSONEncoder().encode(record)
     attributes[kSecValueData] = key.dataRepresentation
     let status = SecItemAdd(attributes as CFDictionary, nil)
+    guard status == errSecSuccess else { throw KeychainFailure(status) }
+    return record
+  }
+
+  /// Resolves only an exact UUID from a complete public inventory; never selects by label.
+  public static func deletionTarget(id: UUID, inventory: Inventory) throws -> KeyRecord {
+    guard inventory.complete else { throw KeyDeletionError.incompleteInventory }
+    let matches = inventory.keys.filter { $0.id == id }
+    guard !matches.isEmpty else { throw KeyDeletionError.notFound }
+    guard matches.count == 1 else { throw KeyDeletionError.ambiguous }
+    return matches[0]
+  }
+
+  /// Removes only the matching dedicated item. No private representation is read or exported.
+  public func delete(id: UUID) throws -> KeyRecord {
+    try Self.delete(id: id, inventory: inventory(), group: group) { attributes in
+      SecItemDelete(attributes as CFDictionary)
+    }
+  }
+
+  /// Credential-free seam exercising the same scoped query and status handling as live deletion.
+  static func delete(
+    id: UUID, inventory: Inventory, group: String, remove: ([CFString: Any]) -> OSStatus
+  ) throws -> KeyRecord {
+    let record = try deletionTarget(id: id, inventory: inventory)
+    let attributes: [CFString: Any] = [
+      kSecClass: kSecClassGenericPassword, kSecAttrService: service,
+      kSecAttrAccessGroup: group, kSecUseDataProtectionKeychain: true,
+      kSecAttrSynchronizable: false, kSecAttrAccount: record.id.uuidString,
+      kSecAttrAccessible: record.policy.accessibility,
+      kSecUseAuthenticationContext: noninteractiveContext(),
+    ]
+    let status = remove(attributes)
     guard status == errSecSuccess else { throw KeychainFailure(status) }
     return record
   }

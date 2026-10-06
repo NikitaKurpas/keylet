@@ -18,14 +18,10 @@ import urllib.request
 import urllib.error
 import zipfile
 
+from bundle_version import version, set_bundle_version
+
 ROOT = Path(__file__).resolve().parent.parent
 TAP = 'NikitaKurpas/homebrew-tap'
-
-
-def version(tag):
-    if not re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', tag):
-        raise ValueError('Release tag must be vMAJOR.MINOR.PATCH')
-    return tag[1:]
 
 
 def run(args, *, env=None, capture=True):
@@ -159,16 +155,6 @@ def stage_release_secrets(directory, release_version):
     profile = write_secret(directory, 'release.provisionprofile', require_env('DEVELOPER_ID_PROFILE_BASE64'))
     notary_key = write_secret(directory, 'notary.p8', require_env('NOTARY_KEY_BASE64')) if release_version is not None else None
     return certificate, profile, notary_key
-
-
-def set_bundle_version(app, release_version):
-    if release_version is None:
-        return
-    info_path = app / 'Contents/Info.plist'
-    info = plistlib.loads(info_path.read_bytes())
-    info['CFBundleShortVersionString'] = release_version
-    info['CFBundleVersion'] = release_version
-    info_path.write_bytes(plistlib.dumps(info))
 
 
 def prepare_signing(release_version):

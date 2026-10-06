@@ -19,6 +19,7 @@ bundle: build
 	mkdir -p dist/Keylet.app/Contents/Resources/Licenses
 	cp licenses/swift-argument-parser-LICENSE.txt dist/Keylet.app/Contents/Resources/Licenses/
 	cp packaging/Info.plist dist/Keylet.app/Contents/Info.plist
+	python3 scripts/bundle_version.py dist/Keylet.app
 	install -m 755 packaging/keylet-ssh-sign dist/Keylet.app/Contents/Resources/keylet-ssh-sign
 	cp "$$(swift build -c release --show-bin-path)/keylet" dist/Keylet.app/Contents/MacOS/keylet
 unsigned-bundle: build

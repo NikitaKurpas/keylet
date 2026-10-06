@@ -7,7 +7,7 @@ import Security
 // The legacy global flag is accepted anywhere before `--`. All commands, options,
 // validation and help are handled by ArgumentParser; this normalization preserves
 // existing `keylet --json keys ...` and `keylet keys ... --json` invocations.
-let keyletVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+let keyletVersion = AppVersion.read(executable: Bundle.main.executableURL)
 
 /// Owns normalized CLI arguments and dispatches the command with the selected output mode.
 struct CLIInvocation {
@@ -104,7 +104,7 @@ struct Keylet: ParsableCommand {
     discussion:
       "Credential operations require a signed Keylet.app and authorized profile. Use SSH_AUTH_SOCK with stock ssh/git; no global settings are changed.",
     version: keyletVersion,
-    subcommands: [Doctor.self, Keys.self, Agent.self, WireProtocol.self, Audit.self])
+    subcommands: [Doctor.self, Version.self, Keys.self, Agent.self, WireProtocol.self, Audit.self])
   @Flag(help: "Return stable JSON, including errors. Accepted before or after the subcommand.")
   var json = false
   mutating func run() throws {
@@ -116,25 +116,34 @@ struct Keylet: ParsableCommand {
   }
 }
 
+struct Version: ParsableCommand {
+  static let configuration = CommandConfiguration(abstract: "Show the CLI version.")
+  mutating func run() throws {
+    if jsonRequested {
+      try output(["ok": true, "version": keyletVersion])
+    } else {
+      print(keyletVersion)
+    }
+  }
+}
+
 struct Doctor: ParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Offline signing/hardware readiness; no Keychain reads or audit database writes.")
+    abstract: "Check hardware and signing metadata without using keys or the audit database.")
   mutating func run() throws {
-    let ready = (try? SigningContext.current()) != nil
-    try output([
-      "ok": true, "version": keyletVersion, "offline": true, "network_auth": "not required",
-      "secure_enclave_available": SecureEnclave.isAvailable, "signature_shape_ready": ready,
-      "credential_access_verified": false, "provisioning_verified": false,
-      "minimum_macos": "26.4", "supported_runtime": SigningContext.supportedRuntime,
-      "security_policy_enforcement_verified": false,
-      "identifier": SigningContext.identifier, "socket": SocketAgent.defaultSocket,
-      "audit_path": AuditStore.defaultPath,
-      "missing_setup": ready
-        ? []
-        : [
-          "Signed sandbox/Enhanced Security bundle, authorized dedicated Keychain group and matching provisioning profile"
-        ],
-    ])
+    let runtime = SigningContext.supportedRuntime
+    let report = DoctorReport(
+      version: keyletVersion, runtime: runtime, enclave: SecureEnclave.isAvailable,
+      signingMetadata: runtime ? (try? SigningContext.current()) != nil : nil,
+      socket: SocketAgent.defaultSocket)
+    if jsonRequested {
+      guard let object = try encodedObject(report) as? [String: Any] else {
+        throw AgentError.unavailable
+      }
+      try output(object)
+    } else {
+      print(report.text)
+    }
   }
 }
 

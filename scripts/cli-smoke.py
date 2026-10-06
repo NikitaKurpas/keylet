@@ -11,13 +11,16 @@ def run(args):
     return p.returncode, json.loads(p.stdout)
 
 code, doctor = run(['doctor'])
-assert code == 0 and doctor['offline'] and not doctor['credential_access_verified']
+assert code == 0 and doctor['ok'] and doctor['checks']['credential_access'] == 'not_checked'
+assert doctor['checks']['provisioning'] == 'not_checked'
+assert doctor['checks']['security_policy_enforcement'] == 'not_checked'
+assert all(field not in doctor for field in ['offline', 'minimum_macos', 'audit_path'])
 for args in [['keys', 'public'], ['keys', 'public', '--id', 'bad'], ['keys', 'resolve'],
              ['keys', 'resolve', '--label', ''], ['agent', '--key', 'bad'], ['protocol', 'decode', '--hex', '']]:
     code, result = run(args)
     assert code == 1 and result['error']['code'] == 'invalid_arguments', (args, result)
     assert result['error']['message'] and 'help' in result['error']['message']
-for command in [[], ['doctor'], ['keys'], ['keys', 'list'], ['keys', 'resolve'], ['keys', 'public'],
+for command in [[], ['doctor'], ['version'], ['keys'], ['keys', 'list'], ['keys', 'resolve'], ['keys', 'public'],
                 ['keys', 'create'], ['keys', 'delete'], ['agent'], ['protocol'], ['protocol', 'decode'], ['audit'], ['audit', 'list'], ['audit', 'top']]:
     code, result = run([*command, '--help'])
     assert code == 0 and result['ok'] and 'usage:' in result['help'].lower(), command
@@ -36,12 +39,12 @@ for args in [['doctor', '--json'], ['keys', 'create', '--label', 'preview', '--p
     p = subprocess.run([binary, *args], text=True, capture_output=True, check=False)
     assert p.returncode == 0 and json.loads(p.stdout)['ok']
 p = subprocess.run([binary, '--json', '--version'], text=True, capture_output=True, check=False)
-assert p.returncode == 0 and json.loads(p.stdout)['version'] == '0.1.0'
+assert p.returncode == 0 and json.loads(p.stdout)['version'] == doctor['version']
 p = subprocess.run([binary, '--json', 'doctor', '--version'], text=True, capture_output=True, check=False)
-assert p.returncode == 0 and json.loads(p.stdout)['version'] == '0.1.0'
+assert p.returncode == 0 and json.loads(p.stdout)['version'] == doctor['version']
 p = subprocess.run([binary], text=True, capture_output=True, check=False)
 assert p.returncode == 0 and 'USAGE:' in p.stdout and 'audit' in p.stdout
-print('CLI smoke passed: twelve validation errors, thirteen help surfaces, offline doctor, dry-run, wire inspection, global JSON, version')
+print('CLI smoke passed: validation errors, help, hardware/signature doctor, dry-run, wire inspection, JSON, version')
 
 # Deletion validation must fail before signing setup or any Keychain access.
 target = '00000000-0000-0000-0000-000000000001'

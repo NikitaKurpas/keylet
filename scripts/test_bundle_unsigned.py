@@ -1,4 +1,5 @@
 import pathlib
+import plistlib
 import tempfile
 import unittest
 import bundle_unsigned
@@ -9,7 +10,8 @@ class UnsignedBundleTests(unittest.TestCase):
         (root / 'packaging').mkdir()
         (root / 'licenses').mkdir()
         (root / 'licenses/swift-argument-parser-LICENSE.txt').write_bytes(b'public license fixture')
-        (root / 'packaging/Info.plist').write_bytes(b'public plist fixture')
+        (root / 'packaging/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.1.0'}))
+        (root / 'version.txt').write_text('2.3.4\n')
         (root / 'packaging/keylet-ssh-sign').write_bytes(b'public signer fixture')
         for name in ['LICENSE', 'NOTICE.md', 'binary']:
             (root / name).write_bytes(b'public fixture')
@@ -22,6 +24,9 @@ class UnsignedBundleTests(unittest.TestCase):
             (retained / 'retained').write_bytes(b'unchanged signed fixture')
             out = bundle_unsigned.bundle(root, binary)
             self.assertEqual((out / 'Contents/MacOS/keylet').read_bytes(), binary.read_bytes())
+            info = plistlib.loads((out / 'Contents/Info.plist').read_bytes())
+            self.assertEqual(info['CFBundleShortVersionString'], '2.3.4')
+            self.assertEqual(info['CFBundleVersion'], '2.3.4')
             helper = out / 'Contents/Resources/keylet-ssh-sign'
             self.assertEqual(helper.read_bytes(), (root / 'packaging/keylet-ssh-sign').read_bytes())
             self.assertEqual(helper.stat().st_mode & 0o777, 0o755)

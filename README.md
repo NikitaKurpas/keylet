@@ -41,7 +41,10 @@ Requires an Apple Silicon Mac, macOS 26.4 or later, and [Homebrew](https://brew.
 ```sh
 brew install NikitaKurpas/tap/keylet
 keylet doctor
+keylet version
 ```
+
+Doctor checks hardware and signing metadata without using keys. Credential access, provisioning and security policy enforcement are reported as not checked.
 
 ## Usage
 

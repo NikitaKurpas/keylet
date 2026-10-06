@@ -6,6 +6,8 @@ import shutil
 import stat
 import subprocess
 
+from bundle_version import source_version, set_bundle_version
+
 
 def directory(path):
     if path.exists() or path.is_symlink():
@@ -23,6 +25,7 @@ def regular(path):
 
 
 def bundle(root, binary):
+    bundle_version = source_version(root)
     destination = root / 'dist/unsigned/Keylet.app'
     for path in [root / 'dist', root / 'dist/unsigned', destination,
                  destination / 'Contents', destination / 'Contents/MacOS',
@@ -47,6 +50,7 @@ def bundle(root, binary):
     for source, target in copies:
         shutil.copyfile(source, target)
         target.chmod(0o755 if target.name in ('keylet', 'keylet-ssh-sign') else 0o644)
+    set_bundle_version(destination, bundle_version)
     return destination
 
 

@@ -105,18 +105,13 @@ keylet audit top --limit 10
 keylet --help
 ```
 
-`audit list` and `audit top` return readable JSON by default. Add `--json` to any command for the existing success/error envelope, now pretty-printed. Audit events retain the timestamp, action, key UUID, fingerprint, outcome, byte count and error code; peer metadata and request IDs are no longer recorded.
-
-The store keeps the newest 10,000 events by event ID, pruning within the write transaction. Signing writes an intent and a completion event, so the limit counts events, not signatures. `audit list --before EVENT_ID` pages through older retained events with an exclusive cursor. Pruning bounds the row count; it does not guarantee a 5 MB file size.
-
-On upgrade, stop older agents before starting the new version; follow the [upgrade steps](#upgrade) below. The new agent migrates audit schema 1 to 2 transactionally, preserving retained event IDs and public metadata while dropping the five removed columns and pruning any overflow. Read-only audit commands can read either schema without migrating. Older versions cannot use schema 2; do not run them concurrently or downgrade against the migrated database.
+Audit commands return readable JSON by default; add `--json` to other commands for machine-readable results. Logs keep the newest 10,000 events, including signing intents and outcomes. Use `audit list --before EVENT_ID` to page through older entries.
 
 ### Upgrade
 
 ```sh
-brew services stop keylet
 brew upgrade keylet
-brew services start keylet
+brew services restart keylet
 ```
 
 ## Development

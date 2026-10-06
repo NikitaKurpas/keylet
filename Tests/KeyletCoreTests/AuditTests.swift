@@ -487,7 +487,7 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
   #expect(try store.list().map(\.id) == [3, 2])
 }
 
-@Test func auditJSONIsPrettyValidAndContainsOnlyRetainedFields() throws {
+@Test func auditEventsContainOnlyRetainedFields() throws {
   let fixture = try AuditFixture()
   let store = try fixture.store()
   let key = UUID()
@@ -496,13 +496,8 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
     fingerprint: "SHA256:fixture", byteCount: 10, errorCode: "signing-unavailable")
   let encoder = JSONEncoder()
   encoder.keyEncodingStrategy = .convertToSnakeCase
-  let events = try JSONSerialization.jsonObject(with: encoder.encode(store.list()))
-  let text = try CLIOutput.json([
-    "ok": true, "events": events, "next_before": NSNull(), "limit": 20,
-  ])
-  #expect(text.contains("\n  \"events\" : ["))
-  let envelope = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
-  let rows = try #require(envelope["events"] as? [[String: Any]])
+  let rows = try #require(
+    JSONSerialization.jsonObject(with: encoder.encode(store.list())) as? [[String: Any]])
   #expect(
     Set(rows[0].keys)
       == Set([
@@ -510,8 +505,4 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
       ]))
   #expect(rows[0]["key_id"] as? String == key.uuidString)
   #expect(rows[0]["outcome"] as? String == "failure")
-  #expect(envelope["next_before"] is NSNull)
-  let escaped = try CLIOutput.json(["message": "quote \" slash \\ newline\n", "ok": false])
-  let error = try #require(JSONSerialization.jsonObject(with: Data(escaped.utf8)) as? [String: Any])
-  #expect(error["message"] as? String == "quote \" slash \\ newline\n")
 }

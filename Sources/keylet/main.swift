@@ -59,7 +59,9 @@ let jsonRequested = invocation.jsonRequested
 /// Writes a result object in the selected text or JSON format.
 func output(_ data: [String: Any], prettyJSON: Bool = false) throws {
   if jsonRequested || prettyJSON {
-    print(try CLIOutput.json(data))
+    let encoded = try JSONSerialization.data(
+      withJSONObject: data, options: [.prettyPrinted, .sortedKeys])
+    print(String(decoding: encoded, as: UTF8.self))
   } else {
     for key in data.keys.sorted() { print("\(key): \(data[key]!)") }
   }

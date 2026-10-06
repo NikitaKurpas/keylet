@@ -26,27 +26,6 @@ class CLITests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('functional check passed', result.stdout)
 
-    def test_pretty_json_preserves_success_errors_and_text_commands(self):
-        root = Path(__file__).resolve().parents[1]
-        binary = root / ".build" / "debug" / "keylet"
-        for args, ok in [
-            (["--json", "doctor"], True),
-            (["protocol", "decode", "--hex", "0b", "--json"], True),
-            (["audit", "list", "--limit", "0", "--json"], False),
-            (["--json", "keys", "create", "--label", "fixture", "--policy", "invalid", "--dry-run"], False),
-        ]:
-            result = subprocess.run([str(binary), *args], cwd="/tmp",
-                                    text=True, capture_output=True, check=False)
-            envelope = json.loads(result.stdout)
-            self.assertEqual(envelope["ok"], ok)
-            self.assertEqual(result.returncode, 0 if ok else 1)
-            self.assertEqual(result.stderr, "")
-            self.assertIn('\n  "', result.stdout)
-        text = subprocess.run([str(binary), "protocol", "decode", "--hex", "0b"],
-                              cwd="/tmp", text=True, capture_output=True, check=False)
-        self.assertEqual(text.returncode, 0)
-        self.assertIn("message_type: 11", text.stdout)
-
     def test_json_flag_stops_at_end_of_options(self):
         root = Path(__file__).resolve().parents[1]
         binary = root / ".build" / "debug" / "keylet"

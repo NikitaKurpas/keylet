@@ -2,6 +2,8 @@
 
 <img src="assets/logo.png" alt="Keylet logo: a mint key shaped like a lowercase k" width="160" height="160">
 
+![Keylet](assets/poster.png)
+
 Unattended Git commit signing and SSH pushes for AI agents, without exposing raw private keys.
 
 Keylet is a command-line SSH agent for Apple Silicon Macs. It keeps private keys in the Secure Enclave so AI agents can sign commits and push code through Git and OpenSSH without handling the keys themselves.

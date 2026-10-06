@@ -18,7 +18,7 @@ for args in [['keys', 'public'], ['keys', 'public', '--id', 'bad'], ['keys', 're
     assert code == 1 and result['error']['code'] == 'invalid_arguments', (args, result)
     assert result['error']['message'] and 'help' in result['error']['message']
 for command in [[], ['doctor'], ['keys'], ['keys', 'list'], ['keys', 'resolve'], ['keys', 'public'],
-                ['keys', 'create'], ['agent'], ['protocol'], ['protocol', 'decode'], ['audit'], ['audit', 'list'], ['audit', 'top']]:
+                ['keys', 'create'], ['keys', 'delete'], ['agent'], ['protocol'], ['protocol', 'decode'], ['audit'], ['audit', 'list'], ['audit', 'top']]:
     code, result = run([*command, '--help'])
     assert code == 0 and result['ok'] and 'usage:' in result['help'].lower(), command
 code, result = run(['keys', 'create', '--label', 'public preview', '--policy', 'after-first-unlock', '--dry-run'])
@@ -42,3 +42,19 @@ assert p.returncode == 0 and json.loads(p.stdout)['version'] == '0.1.0'
 p = subprocess.run([binary], text=True, capture_output=True, check=False)
 assert p.returncode == 0 and 'USAGE:' in p.stdout and 'audit' in p.stdout
 print('CLI smoke passed: twelve validation errors, thirteen help surfaces, offline doctor, dry-run, wire inspection, global JSON, version')
+
+# Deletion validation must fail before signing setup or any Keychain access.
+target = '00000000-0000-0000-0000-000000000001'
+for args in [
+    ['keys', 'delete'],
+    ['keys', 'delete', '--id', 'bad', '--dry-run'],
+    ['keys', 'delete', '--id', target],
+    ['keys', 'delete', '--id', target, '--confirm-id', 'bad'],
+    ['keys', 'delete', '--id', target, '--confirm-id', '00000000-0000-0000-0000-000000000002'],
+    ['keys', 'delete', '--id', target, '--dry-run', '--confirm-id', 'bad'],
+    ['keys', 'delete', '--label', 'fixture', '--dry-run'],
+    ['keys', 'delete', '--id', target, '--yes'],
+]:
+    code, result = run(args)
+    assert code == 1 and result['error']['code'] == 'invalid_arguments', (args, result)
+print('Deletion CLI checks passed: help and eight credential-free validation failures')

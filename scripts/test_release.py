@@ -103,6 +103,8 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('post_install_steps do', result)
         self.assertIn('run "keylet-verify-install", base: :libexec', result)
         self.assertNotIn('def post_install', result)
+        self.assertIn('system libexec/"keylet-verify-install"', result)
+        self.assertNotIn('shell_output', result)
         self.assertNotIn('  version ', result)
         self.assertIn('if digest !=', result)
         self.assertIn('b'*64, result)

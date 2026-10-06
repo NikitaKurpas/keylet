@@ -1,4 +1,5 @@
 """Release validation with synthetic public data; all external commands forbidden."""
+import json
 import base64
 import contextlib
 from types import SimpleNamespace
@@ -324,21 +325,26 @@ class ReleaseTests(unittest.TestCase):
             (root/'dist'/name).write_bytes(original)
             digest = hashlib.sha256(original).hexdigest()
             (root/'dist'/(name+'.sha256')).write_text(digest+'  '+name+'\n')
-            def execute(remote_digest, archive, expected_error=None):
+            def execute(remote_digest, archive, expected_error=None, already=False, newer=False):
                 def response(url, **kwargs):
                     if url.endswith('.sha256'): return io.BytesIO((remote_digest+'  '+name+'\n').encode())
                     return io.BytesIO(archive)
                 def api_response(method, endpoint, token, body=None):
                     if '/releases/tags/' in endpoint: return metadata
-                    if method == 'GET': return {'sha':'previous-formula-sha'}
+                    if method == 'GET':
+                        if already or newer:
+                            content = release.formula_text('v2.0.0' if newer else 'v1.2.3', repo, digest, hashlib.sha256(b'public noncredential binary fixture').hexdigest())
+                            return {'sha': 'previous-formula-sha', 'content': base64.b64encode(content.encode()).decode()}
+                        return {'sha':'previous-formula-sha'}
                     return {'content':{'sha':'updated-formula-sha'}}
                 with patch.object(release,'ROOT',root), patch.dict(os.environ,{'GITHUB_REPOSITORY':repo,'TAP_TOKEN':'noncredential fixture','GH_TOKEN':'noncredential fixture'},clear=True), patch.object(release,'api',side_effect=api_response) as api_mock, patch.object(release.urllib.request,'urlopen',side_effect=response):
                     if expected_error:
                         with self.assertRaisesRegex(ValueError,expected_error): release.update_tap('v1.2.3')
-                        self.assertEqual(api_mock.call_count,1)
+                        self.assertEqual(api_mock.call_count, 2 if newer else 1)
                     else:
                         release.update_tap('v1.2.3')
-                        self.assertEqual(api_mock.call_count,3)
+                        self.assertEqual(api_mock.call_count, 2 if already else 3)
+                        if already: return
                         args = api_mock.call_args.args
                         self.assertEqual(args[0],'PUT')
                         self.assertTrue(args[1].endswith('/contents/Formula/keylet.rb'))
@@ -346,8 +352,91 @@ class ReleaseTests(unittest.TestCase):
                         self.assertEqual(args[3]['sha'],'previous-formula-sha')
                         self.assertIn(digest,base64.b64decode(args[3]['content']).decode())
             execute(digest,original)
+            execute(digest,original,already=True)
+            execute(digest,original,'Refusing to downgrade',newer=True)
             execute(hashlib.sha256(altered).hexdigest(),altered,'differs from this run')
             execute(digest,altered,'checksum mismatch')
+
+    def test_draft_publication_uploads_before_publishing_and_refuses_wrong_target(self):
+        repo = 'owner/repo'
+        environment = {'GITHUB_REPOSITORY': repo, 'GH_TOKEN': 'public fixture'}
+        draft = {'isDraft': True, 'tagName': 'v1.2.3', 'targetCommitish': 'a'*40}
+        with patch.dict(os.environ, environment, clear=True), patch.object(release, 'run', side_effect=[json.dumps(draft).encode(), ('a'*40).encode(), b'', b'']) as command:
+            release.publish('v1.2.3')
+            self.assertEqual([call.args[0][:3] for call in command.call_args_list],
+                             [['gh', 'release', 'view'], ['git', 'rev-parse', 'HEAD'], ['gh', 'release', 'upload'], ['gh', 'release', 'edit']])
+            self.assertIn('--clobber', command.call_args_list[2].args[0])
+            self.assertIn('--draft=false', command.call_args_list[3].args[0])
+        for altered in [dict(draft, isDraft=False), dict(draft, targetCommitish='main'), dict(draft, tagName='v9.9.9')]:
+            with patch.dict(os.environ, environment, clear=True), patch.object(release, 'run', side_effect=[json.dumps(altered).encode(), ('a'*40).encode()]) as command:
+                with self.assertRaisesRegex(ValueError, 'exact tagged commit'): release.publish('v1.2.3')
+                self.assertEqual(command.call_count, 2)
+        with patch.dict(os.environ, environment, clear=True), patch.object(release, 'run', side_effect=[json.dumps(draft).encode(), ('a'*40).encode(), ValueError('upload failed')]) as command:
+            with self.assertRaisesRegex(ValueError, 'upload failed'): release.publish('v1.2.3')
+            self.assertEqual(command.call_count, 3)
+        with patch.dict(os.environ, environment, clear=True), patch.object(release, 'run', side_effect=[ValueError('not found'), b'']) as command:
+            release.publish('v1.2.3')
+            self.assertEqual(command.call_args.args[0][:3], ['gh', 'release', 'create'])
+
+    def test_exact_main_ci_gate_and_release_pr_configuration(self):
+        sha, repo = 'a'*40, 'owner/repo'
+        good = {'head_sha': sha, 'head_branch': 'main', 'event': 'push', 'conclusion': 'success', 'head_repository': {'full_name': repo}}
+        environment = {'GITHUB_REPOSITORY': repo, 'GH_TOKEN': 'public fixture'}
+        for run in [good, dict(good, head_sha='b'*40), dict(good, head_branch='feature'), dict(good, event='pull_request'), dict(good, conclusion='failure'), dict(good, head_repository={'full_name': 'fork/repo'})]:
+            with patch.dict(os.environ, environment, clear=True), patch.object(release, 'run', return_value=sha.encode()), patch.object(release, 'api', return_value={'workflow_runs': [run]}):
+                if run == good: release.check_ci('v1.2.3')
+                else:
+                    with self.assertRaisesRegex(ValueError, 'successful main CI'): release.check_ci('v1.2.3')
+        config = json.loads((release.ROOT/'release-please-config.json').read_text())
+        self.assertTrue(config['packages']['.']['draft'])
+        self.assertTrue(config['packages']['.']['force-tag-creation'])
+        workflow = (release.ROOT/'.github/workflows/release-please.yml').read_text()
+        self.assertIn("steps.release.outputs.release_created == 'true'", workflow)
+        self.assertIn('gh workflow run release.yml --ref main', workflow)
+        self.assertIn("github.event.workflow_run.event == 'push'", workflow)
+        self.assertNotIn('secrets.', workflow)
+        release_workflow = (release.ROOT/'.github/workflows/release.yml').read_text()
+        self.assertLess(release_workflow.index('release.check_ci'), release_workflow.index('secrets.DEVELOPER_ID'))
+        self.assertIn('gh release download', release_workflow)
+        self.assertEqual(release_workflow.count("if: steps.published.outputs.exists != 'true'"), 3)
+
+    def test_recovered_assets_require_expected_certificate_and_notarization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root/'dist').mkdir()
+            archive = root/'dist/Keylet-1.2.3-arm64.zip'
+            with zipfile.ZipFile(archive, 'w') as fixture:
+                fixture.writestr('Keylet.app/Contents/MacOS/keylet', b'public fixture')
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            archive.with_suffix('.zip.sha256').write_text(digest+'  '+archive.name+'\n')
+            certificate = b'public certificate fixture'
+            def execute(args):
+                if args[0] == 'ditto':
+                    contents = Path(args[-1])/'Keylet.app/Contents'
+                    contents.mkdir(parents=True)
+                    (contents/'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'me.kurpas.keylet', 'CFBundleShortVersionString': '1.2.3'}))
+                if args[:2] == ['codesign', '-d']:
+                    Path(args[2].split('=', 1)[1]+'0').write_bytes(certificate)
+                return b''
+            fingerprint = hashlib.sha1(certificate).hexdigest()
+            for identity in [fingerprint, 'b'*40]:
+                with patch.object(Path, 'cwd', return_value=root), patch.dict(os.environ, {'DEVELOPER_ID_IDENTITY': identity}, clear=True), patch.object(release, 'run', side_effect=execute) as command:
+                    if identity == fingerprint:
+                        release.verify_recovered('v1.2.3')
+                        self.assertEqual(command.call_args.args[0][:2], ['spctl', '--assess'])
+                        self.assertIn(['xcrun', 'stapler', 'validate'], [call.args[0][:3] for call in command.call_args_list])
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'unexpected signing certificate'): release.verify_recovered('v1.2.3')
+                        self.assertEqual(command.call_count, 3)
+
+    def test_recovery_helpers_are_available_for_old_tags(self):
+        workflow = (release.ROOT/'.github/workflows/release.yml').read_text()
+        self.assertIn('ref: ${{ github.sha }}', workflow)
+        self.assertIn('path: .release-tools', workflow)
+        self.assertIn("sys.path.insert(0, '.release-tools/scripts')", workflow)
+        self.assertIn('release.ROOT = Path.cwd()', workflow)
+        self.assertIn('release.update_tap(sys.argv[1])', workflow)
+        self.assertNotIn('scripts/release.py tap', workflow)
 
     def test_missing_inputs_and_bad_tag_fail_before_operations(self):
         with patch.dict(os.environ, {}, clear=True):

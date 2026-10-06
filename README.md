@@ -141,6 +141,10 @@ dist/Keylet.app/Contents/MacOS/keylet doctor
 
 `make bundle` replaces the local deployment bundle; sign it again after rebuilding. For profile setup, see [Apple's development provisioning guide](https://developer.apple.com/help/account/provisioning-profiles/create-a-development-provisioning-profile/).
 
+### Releases
+
+After successful `main` CI, Release Please prepares a version and changelog PR. Merge it to publish a signed, notarized release and update Homebrew. See [RELEASE.md](RELEASE.md) for setup and recovery.
+
 ## Maintainers
 
 [Nikita Kurpas](https://github.com/NikitaKurpas).

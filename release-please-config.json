@@ -1,0 +1,11 @@
+{
+  "bootstrap-sha": "f03b25d91ec7fd192fca71fa7f4f92ca0622e0cf",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "include-component-in-tag": false,
+      "draft": true,
+      "force-tag-creation": true
+    }
+  }
+}

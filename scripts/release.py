@@ -259,14 +259,65 @@ def api(method, endpoint, token, body=None):
         return json.load(response)
 
 
+def check_ci(tag):
+    version(tag)
+    repository = validate_repository(require_env('GITHUB_REPOSITORY'))
+    sha = run(['git', 'rev-parse', 'HEAD']).decode().strip()
+    result = api('GET', 'repos/' + repository + '/actions/workflows/ci.yml/runs?head_sha=' + sha + '&event=push&per_page=100', require_env('GH_TOKEN'))
+    if not any(item['head_sha'] == sha and item['head_branch'] == 'main'
+               and item['event'] == 'push' and item['conclusion'] == 'success'
+               and item['head_repository']['full_name'] == repository
+               for item in result['workflow_runs']):
+        raise ValueError('Exact tagged commit requires successful main CI; retry after CI passes')
+
+
+def verify_recovered(tag):
+    """Authenticate downloaded assets before a published-release tap retry."""
+    release_version = version(tag)
+    archive = Path.cwd() / 'dist' / ('Keylet-' + release_version + '-arm64.zip')
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    if archive.with_suffix('.zip.sha256').read_text().strip() != digest + '  ' + archive.name:
+        raise ValueError('Recovered archive checksum mismatch')
+    archive_binary_digest(archive)
+    with tempfile.TemporaryDirectory(prefix='keylet-recovery-check-') as temporary:
+        app = Path(temporary) / 'Keylet.app'
+        run(['ditto', '-x', '-k', str(archive), temporary])
+        run(['codesign', '--verify', '--strict', '--verbose=2', str(app)])
+        certificate = Path(temporary) / 'certificate'
+        run(['codesign', '-d', '--extract-certificates=' + str(certificate), str(app)])
+        fingerprint = hashlib.sha1(certificate.with_name('certificate0').read_bytes()).hexdigest()
+        if fingerprint.upper() != require_env('DEVELOPER_ID_IDENTITY').upper():
+            raise ValueError('Recovered archive has an unexpected signing certificate')
+        info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+        if info.get('CFBundleIdentifier') != 'me.kurpas.keylet' or info.get('CFBundleShortVersionString') != release_version:
+            raise ValueError('Recovered archive has unexpected bundle metadata')
+        run(['xcrun', 'stapler', 'validate', str(app)])
+        run(['spctl', '--assess', '--type', 'execute', str(app)])
+
+
 def publish(tag):
     release_version = version(tag)
     repository = validate_repository(require_env('GITHUB_REPOSITORY'))
     archive = ROOT / 'dist' / ('Keylet-' + release_version + '-arm64.zip')
     checksum_path = archive.with_suffix('.zip.sha256')
-    # gh authenticates from GH_TOKEN, never from a command argument or remote URL.
-    run(['gh', 'release', 'create', tag, str(archive), str(checksum_path), '--repo', repository,
-         '--verify-tag', '--title', 'Keylet ' + release_version, '--generate-notes'])
+    # gh also resolves drafts; REST releases/tags only resolves published releases.
+    try:
+        metadata = run(['gh', 'release', 'view', tag, '--repo', repository,
+                        '--json', 'isDraft,tagName,targetCommitish'])
+    except ValueError:
+        existing = None
+    else:
+        existing = json.loads(metadata)
+    if existing is not None:
+        sha = run(['git', 'rev-parse', 'HEAD']).decode().strip()
+        if not existing['isDraft'] or existing['tagName'] != tag or existing['targetCommitish'] != sha:
+            raise ValueError('Expected a draft release targeting the exact tagged commit')
+        run(['gh', 'release', 'upload', tag, str(archive), str(checksum_path), '--repo', repository, '--clobber'])
+        run(['gh', 'release', 'edit', tag, '--repo', repository, '--draft=false'])
+    else:
+        # Preserve the existing manually tagged release path.
+        run(['gh', 'release', 'create', tag, str(archive), str(checksum_path), '--repo', repository,
+             '--verify-tag', '--title', 'Keylet ' + release_version, '--generate-notes'])
 
 
 def update_tap(tag):
@@ -312,6 +363,14 @@ def update_tap(tag):
         if error.code != 404:
             raise
         current = {}
+    if current.get('content'):
+        current_formula = base64.b64decode(current['content']).decode()
+        if current_formula == content:
+            print('Public Keylet formula already matches ' + release_version)
+            return
+        current_tag = re.search(re.escape('https://github.com/' + repository + '/releases/download/') + r'(v[0-9]+\.[0-9]+\.[0-9]+)/', current_formula)
+        if current_tag and tuple(map(int, version(current_tag[1]).split('.'))) > tuple(map(int, release_version.split('.'))):
+            raise ValueError('Refusing to downgrade the Homebrew formula to an older release')
     body = {'message': 'Update Keylet to ' + release_version, 'content': base64.b64encode(content.encode()).decode()}
     if current.get('sha'):
         body['sha'] = current['sha']
@@ -324,9 +383,9 @@ if __name__ == '__main__':
         if len(sys.argv) == 2 and sys.argv[1] == 'check-signing':
             prepare(None)
         else:
-            if len(sys.argv) != 3 or sys.argv[1] not in ['prepare', 'publish', 'tap']:
-                raise ValueError('Usage: release.py check-signing | prepare|publish|tap vMAJOR.MINOR.PATCH')
-            {'prepare': prepare, 'publish': publish, 'tap': update_tap}[sys.argv[1]](sys.argv[2])
+            if len(sys.argv) != 3 or sys.argv[1] not in ['prepare', 'publish', 'tap', 'check-ci']:
+                raise ValueError('Usage: release.py check-signing | prepare|publish|tap|check-ci vMAJOR.MINOR.PATCH')
+            {'prepare': prepare, 'publish': publish, 'tap': update_tap, 'check-ci': check_ci}[sys.argv[1]](sys.argv[2])
     except Exception as error:
         print('release: ' + (str(error) if isinstance(error, ValueError) else 'Release operation failed; sensitive tool output withheld'), file=sys.stderr)
         sys.exit(1)

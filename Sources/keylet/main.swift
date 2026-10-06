@@ -8,10 +8,55 @@ import Security
 // validation and help are handled by ArgumentParser; this normalization preserves
 // existing `keylet --json keys ...` and `keylet keys ... --json` invocations.
 let keyletVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1.0"
-let suppliedArguments = Array(CommandLine.arguments.dropFirst())
-let optionArguments = suppliedArguments.prefix { $0 != "--" }
-let jsonRequested = optionArguments.contains("--json")
 
+/// Owns normalized CLI arguments and dispatches the command with the selected output mode.
+struct CLIInvocation {
+  let arguments: [String]
+  let jsonRequested: Bool
+
+  init(_ rawArguments: [String]) {
+    let endOfOptions = rawArguments.firstIndex(of: "--") ?? rawArguments.endIndex
+    jsonRequested = rawArguments[..<endOfOptions].contains("--json")
+    arguments = rawArguments.enumerated().compactMap { index, argument in
+      index < endOfOptions && argument == "--json" ? nil : argument
+    }
+  }
+
+  /// Parses and runs the command, preserving ArgumentParser's help and version exits.
+  func run() {
+    var isParsing = true
+    do {
+      var command = try Keylet.parseAsRoot(arguments)
+      isParsing = false
+      try command.run()
+    } catch {
+      if Keylet.exitCode(for: error) == .success {
+        writeHelpOrVersion(for: error)
+        exit(0)
+      }
+      reportFailure(error, isParsing: isParsing)
+      exit(1)
+    }
+  }
+
+  private func writeHelpOrVersion(for error: Error) {
+    let text = Keylet.fullMessage(for: error)
+    guard jsonRequested else {
+      print(text, terminator: text.hasSuffix("\n") ? "" : "\n")
+      return
+    }
+    if arguments.contains("--version"), !arguments.contains("--help"), !arguments.contains("-h") {
+      try? output(["ok": true, "version": text.trimmingCharacters(in: .whitespacesAndNewlines)])
+    } else {
+      try? output(["ok": true, "help": text])
+    }
+  }
+}
+
+let invocation = CLIInvocation(Array(CommandLine.arguments.dropFirst()))
+let jsonRequested = invocation.jsonRequested
+
+/// Writes a result object in the selected text or JSON format.
 func output(_ data: [String: Any]) throws {
   if jsonRequested {
     let encoded = try JSONSerialization.data(withJSONObject: data, options: [.sortedKeys])
@@ -20,15 +65,21 @@ func output(_ data: [String: Any]) throws {
     for key in data.keys.sorted() { print("\(key): \(data[key]!)") }
   }
 }
+
+/// Encodes a value with the CLI's stable snake_case JSON key convention.
 func encodedObject<T: Encodable>(_ value: T) throws -> Any {
   let encoder = JSONEncoder()
   encoder.keyEncodingStrategy = .convertToSnakeCase
   return try JSONSerialization.jsonObject(with: encoder.encode(value))
 }
+
+/// Parses a UUID argument or reports the CLI's invalid-arguments error.
 func validatedUUID(_ text: String) throws -> UUID {
   guard let id = UUID(uuidString: text) else { throw AgentError.invalidArguments }
   return id
 }
+
+/// Returns the public fields exposed for a key, including its SSH fingerprint.
 func recordJSON(_ record: KeyRecord) throws -> [String: Any] {
   [
     "id": record.id.uuidString, "label": record.label, "policy": record.policy.rawValue,
@@ -36,6 +87,8 @@ func recordJSON(_ record: KeyRecord) throws -> [String: Any] {
     "public_key": try record.openSSH(),
   ]
 }
+
+/// Resolves one key by UUID, or by exact label when the inventory is complete.
 func selectedKey(id: UUID? = nil, label: String? = nil) throws -> KeyRecord {
   let inventory = KeyStore(context: try SigningContext.current()).inventory()
   let matches = inventory.keys.filter { id != nil ? $0.id == id : $0.label == label }
@@ -61,6 +114,7 @@ struct Keylet: ParsableCommand {
     }
   }
 }
+
 struct Doctor: ParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Offline signing/hardware readiness; no Keychain reads or audit database writes.")
@@ -82,6 +136,7 @@ struct Doctor: ParsableCommand {
     ])
   }
 }
+
 struct Keys: ParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Inspect or create dedicated keys; no private-key export.",
@@ -98,6 +153,7 @@ struct Keys: ParsableCommand {
       ])
     }
   }
+
   struct Resolve: ParsableCommand {
     static let configuration = CommandConfiguration(
       abstract: "Resolve an exact unique label to a UUID.")
@@ -107,6 +163,7 @@ struct Keys: ParsableCommand {
       try output(["ok": true, "key": try recordJSON(selectedKey(label: label))])
     }
   }
+
   struct Public: ParsableCommand {
     static let configuration = CommandConfiguration(abstract: "Export the public OpenSSH key only.")
     @Option(help: "Key UUID.") var id: String
@@ -120,6 +177,7 @@ struct Keys: ParsableCommand {
       }
     }
   }
+
   struct Create: ParsableCommand {
     static let configuration = CommandConfiguration(
       abstract: "Create one hardware-bound key; preview with --dry-run first.")
@@ -132,6 +190,7 @@ struct Keys: ParsableCommand {
       try KeyStore.validate(label: label)
       guard KeyPolicy(rawValue: policy) != nil else { throw AgentError.invalidArguments }
     }
+
     mutating func run() throws {
       guard let parsedPolicy = KeyPolicy(rawValue: policy) else {
         throw AgentError.invalidArguments
@@ -150,6 +209,7 @@ struct Keys: ParsableCommand {
     }
   }
 }
+
 struct Agent: ParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Serve one selected key in the foreground; no installation.")
@@ -162,6 +222,7 @@ struct Agent: ParsableCommand {
       path: socket ?? SocketAgent.defaultSocket, store: store, id: validatedUUID(key))
   }
 }
+
 struct WireProtocol: ParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "protocol", abstract: "Offline read-only SSH agent wire inspection.",
@@ -177,6 +238,7 @@ struct WireProtocol: ParsableCommand {
         })
       else { throw AgentError.invalidArguments }
     }
+
     mutating func run() throws {
       var data = Data()
       var index = hex.startIndex
@@ -197,6 +259,7 @@ struct WireProtocol: ParsableCommand {
     }
   }
 }
+
 struct Audit: ParsableCommand {
   static let configuration = CommandConfiguration(
     abstract: "Read the bounded local signing audit database; no Keychain access.",
@@ -211,6 +274,7 @@ struct Audit: ParsableCommand {
         throw AgentError.invalidArguments
       }
     }
+
     mutating func run() throws {
       let events = try AuditStore(readOnly: true).list(limit: limit, before: before)
       // An extra empty page is acceptable when the final page is exactly full.
@@ -225,6 +289,7 @@ struct Audit: ParsableCommand {
       ])
     }
   }
+
   struct Top: ParsableCommand {
     static let configuration = CommandConfiguration(
       abstract: "Most successful signatures per key in the retained audit window.")
@@ -232,6 +297,7 @@ struct Audit: ParsableCommand {
     func validate() throws {
       guard (1...200).contains(limit) else { throw AgentError.invalidArguments }
     }
+
     mutating func run() throws {
       try output([
         "ok": true, "keys": try encodedObject(AuditStore(readOnly: true).top(limit: limit)),
@@ -240,84 +306,82 @@ struct Audit: ParsableCommand {
     }
   }
 }
-func reportFailure(_ error: Error, parsing: Bool) {
+
+private struct CLIErrorDetails {
   let code: String
-  switch error {
-  case AgentError.invalidArguments: code = "invalid_arguments"
-  case AgentError.signingSetup: code = "signing_setup_required"
-  case AgentError.invalidPath: code = "unsafe_socket_path"
-  case AuditError.unsafePath: code = "audit_unsafe_path"
-  case AuditError.unavailable: code = "audit_unavailable"
-  case AuditError.unsupportedSchema: code = "audit_schema_unsupported"
-  case AuditError.invalidLimit: code = "invalid_arguments"
-  case let failure as KeychainFailure: code = "keychain_\(failure.status)"
-  default: code = parsing ? "invalid_arguments" : "operation_failed"
-  }
   let message: String
+}
+
+/// Selects the stable machine code and user-facing message for a CLI failure.
+private func errorDetails(for error: Error, isParsing: Bool) -> CLIErrorDetails {
+  let fallbackCode = isParsing ? "invalid_arguments" : "operation_failed"
   switch error {
+  case AgentError.invalidArguments, AuditError.invalidLimit:
+    return CLIErrorDetails(
+      code: "invalid_arguments",
+      message: "Missing or invalid arguments; use the subcommand's --help")
   case AgentError.signingSetup:
-    message = "Use the correctly signed Keylet.app bundle; run doctor and review signing setup"
+    return CLIErrorDetails(
+      code: "signing_setup_required",
+      message: "Use the correctly signed Keylet.app bundle; run doctor and review signing setup")
   case AgentError.invalidPath:
-    message =
-      "Use an absolute short socket path in a user-owned 0700 directory; existing endpoints are refused"
-  case AgentError.unavailable:
-    message = "Key or protection class unavailable, or label not unique; inspect keys list"
-  case AgentError.invalidRequest:
-    message = "Invalid or incomplete SSH payload; inspect protocol decode --help"
-  case is KeychainFailure:
-    message = "Dedicated Keychain operation failed; check provisioning and unlock state"
+    return CLIErrorDetails(
+      code: "unsafe_socket_path",
+      message:
+        "Use an absolute short socket path in a user-owned 0700 directory; existing endpoints are refused"
+    )
   case AuditError.unsafePath:
-    message =
-      "Audit database path or permissions are unsafe; review the private container directory"
+    return CLIErrorDetails(
+      code: "audit_unsafe_path",
+      message:
+        "Audit database path or permissions are unsafe; review the private container directory"
+    )
   case AuditError.unavailable:
-    message =
-      "Audit database unavailable or busy; retry and inspect the documented audit requirements"
+    return CLIErrorDetails(
+      code: "audit_unavailable",
+      message:
+        "Audit database unavailable or busy; retry and inspect the documented audit requirements")
   case AuditError.unsupportedSchema:
-    message =
-      "Audit database schema is unsupported by this version; use a compatible Keylet release"
+    return CLIErrorDetails(
+      code: "audit_schema_unsupported",
+      message:
+        "Audit database schema is unsupported by this version; use a compatible Keylet release"
+    )
+  case let failure as KeychainFailure:
+    return CLIErrorDetails(
+      code: "keychain_\(failure.status)",
+      message: "Dedicated Keychain operation failed; check provisioning and unlock state")
+  case AgentError.unavailable:
+    return CLIErrorDetails(
+      code: fallbackCode,
+      message: "Key or protection class unavailable, or label not unique; inspect keys list")
+  case AgentError.invalidRequest:
+    return CLIErrorDetails(
+      code: fallbackCode,
+      message: "Invalid or incomplete SSH payload; inspect protocol decode --help")
   case AgentError.io:
-    message = "Local socket I/O failed; check endpoint permissions and running clients"
+    return CLIErrorDetails(
+      code: fallbackCode,
+      message: "Local socket I/O failed; check endpoint permissions and running clients")
   default:
-    message =
-      code == "invalid_arguments"
+    let message =
+      isParsing
       ? "Missing or invalid arguments; use the subcommand's --help"
       : "Operation failed; check doctor and the documented setup requirements"
-  }
-  if jsonRequested {
-    try? output(["ok": false, "error": ["code": code, "message": message]])
-  } else if parsing {
-    FileHandle.standardError.write(Data(Keylet.fullMessage(for: error).utf8))
-  } else {
-    FileHandle.standardError.write(Data((code + ": " + message + "\n").utf8))
+    return CLIErrorDetails(code: fallbackCode, message: message)
   }
 }
 
-var arguments = suppliedArguments
-if jsonRequested {
-  // Strip only actual global options before the conventional end-of-options marker.
-  let stop = arguments.firstIndex(of: "--") ?? arguments.endIndex
-  arguments = arguments.enumerated().filter { !($0.offset < stop && $0.element == "--json") }.map(
-    \.element)
-}
-var parsing = true
-do {
-  var command = try Keylet.parseAsRoot(arguments)
-  parsing = false
-  try command.run()
-} catch {
-  if Keylet.exitCode(for: error) == .success {
-    let text = Keylet.fullMessage(for: error)
-    if jsonRequested {
-      if arguments.contains("--version"), !arguments.contains("--help"), !arguments.contains("-h") {
-        try? output(["ok": true, "version": text.trimmingCharacters(in: .whitespacesAndNewlines)])
-      } else {
-        try? output(["ok": true, "help": text])
-      }
-    } else {
-      print(text, terminator: text.hasSuffix("\n") ? "" : "\n")
-    }
-    exit(0)
+/// Writes a failure in the selected format, keeping parser diagnostics on stderr.
+func reportFailure(_ error: Error, isParsing: Bool) {
+  let details = errorDetails(for: error, isParsing: isParsing)
+  if jsonRequested {
+    try? output(["ok": false, "error": ["code": details.code, "message": details.message]])
+  } else if isParsing {
+    FileHandle.standardError.write(Data(Keylet.fullMessage(for: error).utf8))
+  } else {
+    FileHandle.standardError.write(Data((details.code + ": " + details.message + "\n").utf8))
   }
-  reportFailure(error, parsing: parsing)
-  exit(1)
 }
+
+invocation.run()

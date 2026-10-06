@@ -1,4 +1,5 @@
 """CLI parser regressions using the unsigned debug product built by `swift test`."""
+import json
 import subprocess
 import sys
 import unittest
@@ -24,6 +25,31 @@ class CLITests(unittest.TestCase):
                                 cwd="/tmp", text=True, capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('functional check passed', result.stdout)
+
+    def test_json_flag_stops_at_end_of_options(self):
+        root = Path(__file__).resolve().parents[1]
+        binary = root / ".build" / "debug" / "keylet"
+        literal_flag = subprocess.run(
+            [str(binary), "doctor", "--", "--json"], cwd="/tmp",
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(literal_flag.returncode, 1)
+        self.assertEqual(literal_flag.stdout, "")
+        self.assertIn("Unexpected argument '--json'", literal_flag.stderr)
+
+        json_mode = subprocess.run(
+            [str(binary), "--json", "doctor", "--", "--json"], cwd="/tmp",
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(json_mode.returncode, 1)
+        self.assertEqual(json.loads(json_mode.stdout), {
+            "ok": False,
+            "error": {
+                "code": "invalid_arguments",
+                "message": "Missing or invalid arguments; use the subcommand's --help",
+            },
+        })
+        self.assertEqual(json_mode.stderr, "")
 
 
 if __name__ == "__main__":

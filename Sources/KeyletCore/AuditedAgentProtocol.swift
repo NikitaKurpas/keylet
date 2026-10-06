@@ -1,15 +1,15 @@
 import Foundation
 
-/// Audit intent must commit before calling the signer. Completion must commit before returning
-/// a signature. If completion fails, a signature may already have been computed but is withheld;
-/// a retained intent with no completion is an ambiguous attempt, not proof of a signature.
+/// Requires durable intent and completion before releasing a signature.
+/// An intent without completion records an ambiguous attempt, not a successful signature.
 public enum AuditedAgentProtocol {
+  /// Records each request without storing its payload or signature.
   public static func reply(
     to payload: Data, key: KeyRecord?, peer: AuditPeer,
     audit: AuditStore, sign: (Data) throws -> Data
   ) -> Data {
     reply(
-      to: payload, key: key, peer: peer,
+      to: payload, key: key,
       record: { outcome, request, action, count, error in
         try audit.append(
           requestID: request, action: action, outcome: outcome, keyID: key?.id,
@@ -17,52 +17,67 @@ public enum AuditedAgentProtocol {
           peer: peer, errorCode: error)
       }, sign: sign)
   }
+
   // Inject persistence only for credential-free fault tests.
   static func reply(
-    to payload: Data, key: KeyRecord?, peer: AuditPeer,
+    to payload: Data, key: KeyRecord?,
     record: (String, UUID, String, Int?, String?) throws -> Void,
     sign: (Data) throws -> Data
   ) -> Data {
     let requestID = UUID()
-    let action = payload.first == 13 ? "sign" : payload.first == 11 ? "identities" : "unsupported"
-    var attempted = false
-    var persistenceFailed = false
+    let action = auditAction(for: payload)
+    var signingAttempted = false
     let response = AgentProtocol.reply(
       to: payload, keyBlob: try? key?.blob(), label: key?.label ?? "unavailable"
     ) { data in
-      attempted = true
-      guard let key, key.policy != .userPresence else {
-        try record("rejected", requestID, action, data.count, "signing-unavailable")
-        throw AgentError.unavailable
-      }
-      do { try record("intent", requestID, action, data.count, nil) } catch {
-        persistenceFailed = true
-        throw error
-      }
-      let result: Data
-      do {
-        result = try sign(data)
-        // Encoding/shape failures must never be logged as success.
-        _ = try SSHWire.signature(result)
-      } catch {
-        do { try record("failure", requestID, action, data.count, "signing-unavailable") } catch {
-          persistenceFailed = true
-        }
-        throw AgentError.unavailable
-      }
-      do { try record("success", requestID, action, data.count, nil) } catch {
-        persistenceFailed = true
-        throw error
-      }
-      return result
+      signingAttempted = true
+      return try auditedSignature(
+        for: data, key: key,
+        record: { outcome, errorCode in
+          try record(outcome, requestID, action, data.count, errorCode)
+        }, sign: sign)
     }
-    if !attempted && !persistenceFailed {
-      do {
-        try record(
-          response.first == 5 ? "rejected" : "success", requestID, action, nil,
-          response.first == 5 ? "invalid-request" : nil)
-      } catch { return Data([5]) }
+    guard !signingAttempted else { return response }
+
+    let rejected = response == AgentProtocol.failure
+    do {
+      try record(
+        rejected ? "rejected" : "success", requestID, action, nil,
+        rejected ? "invalid-request" : nil)
+      return response
+    } catch {
+      return AgentProtocol.failure
     }
-    return response
+  }
+
+  private static func auditAction(for payload: Data) -> String {
+    switch payload.first.flatMap(SSHAgentMessage.init(rawValue:)) {
+    case .signRequest: return "sign"
+    case .requestIdentities: return "identities"
+    default: return "unsupported"
+    }
+  }
+
+  /// Persists intent before signing and withholds the signature if completion cannot commit.
+  private static func auditedSignature(
+    for data: Data, key: KeyRecord?, record: (String, String?) throws -> Void,
+    sign: (Data) throws -> Data
+  ) throws -> Data {
+    guard let key, key.policy != .userPresence else {
+      try record("rejected", "signing-unavailable")
+      throw AgentError.unavailable
+    }
+    try record("intent", nil)
+
+    let signature: Data
+    do {
+      signature = try sign(data)
+      _ = try SSHWire.signature(signature)
+    } catch {
+      try? record("failure", "signing-unavailable")
+      throw AgentError.unavailable
+    }
+    try record("success", nil)
+    return signature
   }
 }

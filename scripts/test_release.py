@@ -186,6 +186,44 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn(['security','list-keychains','-d','user','-s','/fixture/login.keychain-db'], calls)
         self.assertFalse(any('default-keychain' in args for args in calls))
 
+    def test_release_notarizes_before_temporary_keychain_cleanup(self):
+        events = []
+        active = ['/fixture/login.keychain-db']
+        def command(args, **kwargs):
+            nonlocal active
+            events.append(('command', args))
+            if args[:5] == ['security','list-keychains','-d','user','-s']:
+                active = args[5:]
+            if args == ['security','list-keychains','-d','user']:
+                return ('\n'.join('"'+name+'"' for name in active)+'\n').encode()
+            return b''
+        def notarize(app, directory, notary_key):
+            events.append(('notarize', active[:]))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contents = root/'dist/Keylet.app/Contents'
+            contents.mkdir(parents=True)
+            (contents/'Info.plist').write_bytes(plistlib.dumps({}))
+            environment = {name:base64.b64encode(b'noncredential fixture').decode()
+                for name in ['DEVELOPER_ID_P12_BASE64','DEVELOPER_ID_PROFILE_BASE64','NOTARY_KEY_BASE64']}
+            environment.update(DEVELOPER_ID_P12_PASSWORD='noncredential fixture', DEVELOPER_ID_IDENTITY='A'*40, APPLE_TEAM_ID='EXAMPL1234')
+            with patch.object(release,'ROOT',root), patch.object(sign_bundle,'validate_bundle'), \
+                    patch.object(release,'run',side_effect=command), patch.object(release,'run_signer'), \
+                    patch.object(release,'notarize',side_effect=notarize), patch.dict(os.environ,environment,clear=True):
+                release.prepare_signing('1.2.3')
+
+        notarize_index = next(index for index, event in enumerate(events) if event[0] == 'notarize')
+        restore_index = next(index for index, event in enumerate(events)
+            if event[0] == 'command' and event[1][:5] == ['security','list-keychains','-d','user','-s'] and len(event[1]) == 6)
+        delete_index = next(index for index, event in enumerate(events)
+            if event[0] == 'command' and event[1][:2] == ['security','delete-keychain'])
+        keychain = next(event[1][-1] for event in events
+            if event[0] == 'command' and event[1][:2] == ['security','create-keychain'])
+        self.assertIn(keychain, events[notarize_index][1])
+        self.assertLess(notarize_index, restore_index)
+        self.assertLess(restore_index, delete_index)
+
     def test_search_list_is_explicit_ordered_and_normalizes_path_aliases(self):
         keychain = Path('/tmp/keylet-public-fixture/keychain-db')
         previous = ['/fixture/login with spaces.keychain-db', '/fixture/other.keychain-db']

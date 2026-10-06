@@ -4,6 +4,7 @@ import Foundation
 import LocalAuthentication
 import Security
 
+/// Immutable Keychain accessibility and Secure Enclave authorization policy.
 public enum KeyPolicy: String, Codable, CaseIterable, Sendable {
   case afterFirstUnlock = "after-first-unlock"
   case whenUnlocked = "when-unlocked"
@@ -17,6 +18,8 @@ public enum KeyPolicy: String, Codable, CaseIterable, Sendable {
     self == .userPresence ? [.privateKeyUsage, .userPresence] : [.privateKeyUsage]
   }
 }
+
+/// Public metadata; contains no private or opaque key representation.
 public struct KeyRecord: Codable, Equatable, Sendable {
   public let id: UUID
   public let label: String
@@ -28,20 +31,26 @@ public struct KeyRecord: Codable, Equatable, Sendable {
     self.policy = policy
     self.publicKey = publicKey
   }
+
   public func blob() throws -> Data { try SSHWire.publicBlob(publicKey) }
   public func openSSH() throws -> String {
     SSHWire.algorithm + " " + (try blob()).base64EncodedString() + " " + label
   }
 }
+
 public struct KeychainFailure: Error {
   public let status: OSStatus
   public init(_ status: OSStatus) { self.status = status }
 }
+
+/// Public keys plus protection classes that could not be read.
 public struct Inventory: Sendable {
   public let keys: [KeyRecord]
   public let unavailableClasses: [String]
   public var complete: Bool { unavailableClasses.isEmpty }
 }
+
+/// Dedicated Keychain group derived from the running executable’s verified signature.
 public struct SigningContext: Sendable {
   public static let identifier = "me.kurpas.keylet"
   public let group: String
@@ -49,6 +58,8 @@ public struct SigningContext: Sendable {
     if #available(macOS 26.4, *) { return true }
     return false
   }
+
+  /// Rejects unsupported runtimes and signatures outside the maintained security policy.
   public static func current() throws -> SigningContext {
     guard supportedRuntime else { throw AgentError.signingSetup }
     var code: SecCode?
@@ -59,7 +70,14 @@ public struct SigningContext: Sendable {
       SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess,
       SecCodeCopySigningInformation(
         staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &info) == errSecSuccess,
-      let values = info as? [String: Any],
+      let values = info as? [String: Any]
+    else { throw AgentError.signingSetup }
+    return try validated(signingInformation: values)
+  }
+
+  /// Validates signature metadata; native provisioning and policy enforcement remain OS duties.
+  static func validated(signingInformation values: [String: Any]) throws -> SigningContext {
+    guard
       values[kSecCodeInfoIdentifier as String] as? String == identifier,
       let team = values[kSecCodeInfoTeamIdentifier as String] as? String,
       let entitlements = values[kSecCodeInfoEntitlementsDict as String] as? [String: Any],
@@ -76,6 +94,8 @@ public struct SigningContext: Sendable {
     return SigningContext(group: team + "." + identifier)
   }
 }
+
+/// Creates and uses hardware-bound keys in the dedicated, nonsynchronizing Keychain group.
 public final class KeyStore {
   public static let service = "me.kurpas.keylet.keys.v1"
   private let group: String
@@ -85,24 +105,26 @@ public final class KeyStore {
     context.interactionNotAllowed = true
     return context
   }
+
   private func query(id: UUID? = nil) -> [CFString: Any] {
-    var q: [CFString: Any] = [
+    var attributes: [CFString: Any] = [
       kSecClass: kSecClassGenericPassword, kSecAttrService: Self.service,
       kSecAttrAccessGroup: group, kSecUseDataProtectionKeychain: true,
       kSecAttrSynchronizable: false, kSecUseAuthenticationContext: Self.noninteractiveContext(),
     ]
-    if let id { q[kSecAttrAccount] = id.uuidString }
-    return q
+    if let id { attributes[kSecAttrAccount] = id.uuidString }
+    return attributes
   }
+
   /// Each class is queried independently on every inventory request: no stale all-or-nothing cache.
   public func inventory() -> Inventory {
-    return Self.readInventory { name, protection in
-      var q = query()
-      q[kSecAttrAccessible] = protection
-      q[kSecReturnAttributes] = true
-      q[kSecMatchLimit] = kSecMatchLimitAll
+    return Self.readInventory { _, protection in
+      var attributes = query()
+      attributes[kSecAttrAccessible] = protection
+      attributes[kSecReturnAttributes] = true
+      attributes[kSecMatchLimit] = kSecMatchLimitAll
       var output: CFTypeRef?
-      let status = SecItemCopyMatching(q as CFDictionary, &output)
+      let status = SecItemCopyMatching(attributes as CFDictionary, &output)
       if status == errSecItemNotFound { return [] }
       guard status == errSecSuccess, let rows = output as? [[CFString: Any]] else {
         throw KeychainFailure(status)
@@ -117,6 +139,7 @@ public final class KeyStore {
       }
     }
   }
+
   /// Credential-free seam: failure of one protection class cannot hide the other.
   public static func readInventory(fetch: (String, CFString) throws -> [KeyRecord]) -> Inventory {
     var keys: [KeyRecord] = []
@@ -139,11 +162,14 @@ public final class KeyStore {
       keys: keys.sorted { $0.id.uuidString < $1.id.uuidString },
       unavailableClasses: unavailable.sorted())
   }
+
   public static func validate(label: String) throws {
     guard !label.isEmpty, label.utf8.count <= 80,
       label.unicodeScalars.allSatisfy({ $0.value >= 32 && $0.value < 127 && $0 != "\"" })
     else { throw AgentError.invalidArguments }
   }
+
+  /// Persists a new key with an immutable label and policy; never exports its private material.
   public func create(label: String, policy: KeyPolicy) throws -> KeyRecord {
     try Self.validate(label: label)
     var error: Unmanaged<CFError>?
@@ -155,33 +181,33 @@ public final class KeyStore {
     let key = try SecureEnclave.P256.Signing.PrivateKey(accessControl: acl)
     let record = KeyRecord(
       id: UUID(), label: label, policy: policy, publicKey: key.publicKey.x963Representation)
-    var q = query(id: record.id)
-    q.removeValue(forKey: kSecUseAuthenticationContext)
-    q[kSecAttrAccessible] = policy.accessibility
-    q[kSecAttrLabel] = label
-    q[kSecAttrGeneric] = try JSONEncoder().encode(record)
-    q[kSecValueData] = key.dataRepresentation
-    let status = SecItemAdd(q as CFDictionary, nil)
+    var attributes = query(id: record.id)
+    attributes.removeValue(forKey: kSecUseAuthenticationContext)
+    attributes[kSecAttrAccessible] = policy.accessibility
+    attributes[kSecAttrLabel] = label
+    attributes[kSecAttrGeneric] = try JSONEncoder().encode(record)
+    attributes[kSecValueData] = key.dataRepresentation
+    let status = SecItemAdd(attributes as CFDictionary, nil)
     guard status == errSecSuccess else { throw KeychainFailure(status) }
     return record
   }
+
+  /// Reloads and matches stored metadata before signing without authentication UI.
   public func sign(_ data: Data, key record: KeyRecord) throws -> Data {
     // No mode update API: both protections and metadata are immutable after creation.
-    var q = query(id: record.id)
-    q[kSecAttrAccessible] = record.policy.accessibility
-    q[kSecReturnData] = true
-    q[kSecReturnAttributes] = true
+    var attributes = query(id: record.id)
+    attributes[kSecAttrAccessible] = record.policy.accessibility
+    attributes[kSecReturnData] = true
+    attributes[kSecReturnAttributes] = true
     var value: CFTypeRef?
-    let status = SecItemCopyMatching(q as CFDictionary, &value)
+    let status = SecItemCopyMatching(attributes as CFDictionary, &value)
     guard status == errSecSuccess else { throw KeychainFailure(status) }
     guard let row = value as? [CFString: Any], let blob = row[kSecValueData] as? Data,
       let metadata = row[kSecAttrGeneric] as? Data,
       try JSONDecoder().decode(KeyRecord.self, from: metadata) == record
     else { throw AgentError.unavailable }
-    let context = LAContext()
-    context.interactionNotAllowed = true
     let key = try SecureEnclave.P256.Signing.PrivateKey(
-      dataRepresentation: blob, authenticationContext: context)
+      dataRepresentation: blob, authenticationContext: Self.noninteractiveContext())
     guard key.publicKey.x963Representation == record.publicKey else { throw AgentError.unavailable }
     return try key.signature(for: data).rawRepresentation
   }

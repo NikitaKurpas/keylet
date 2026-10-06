@@ -8,6 +8,8 @@ public enum AgentError: Error {
   case io(Int32)
   case invalidArguments, signingSetup
 }
+
+/// Encodes P256 keys, signatures, and length-prefixed fields in SSH wire format.
 public enum SSHWire {
   public static let maximumFrame = 256 * 1024
   public static let algorithm = "ecdsa-sha2-nistp256"
@@ -16,21 +18,28 @@ public enum SSHWire {
       UInt8(value >> 24), UInt8((value >> 16) & 255), UInt8((value >> 8) & 255), UInt8(value & 255),
     ])
   }
+
   public static func string(_ data: Data) -> Data { uint32(UInt32(data.count)) + data }
   public static func string(_ text: String) -> Data { string(Data(text.utf8)) }
+  /// Validates and wraps an X9.63 public key as an SSH identity.
   public static func publicBlob(_ x963: Data) throws -> Data {
     _ = try P256.Signing.PublicKey(x963Representation: x963)
     return string(algorithm) + string("nistp256") + string(x963)
   }
+
   public static func fingerprint(_ blob: Data) -> String {
     "SHA256:"
       + Data(SHA256.hash(data: blob)).base64EncodedString().replacingOccurrences(of: "=", with: "")
   }
+
+  /// Removes leading zeros and preserves the sign of an unsigned integer.
   public static func mpint(_ bytes: Data) -> Data {
     guard let first = bytes.firstIndex(where: { $0 != 0 }) else { return Data() }
     let trimmed = Data(bytes[first...])
-    return trimmed.first! >= 0x80 ? Data([0]) + trimmed : trimmed
+    return bytes[first] >= 0x80 ? Data([0]) + trimmed : trimmed
   }
+
+  /// Wraps a 64-byte P256 signature as the SSH agent signature field.
   public static func signature(_ raw: Data) throws -> Data {
     guard raw.count == 64 else { throw AgentError.invalidRequest }
     let r = mpint(Data(raw.prefix(32)))
@@ -38,6 +47,8 @@ public enum SSHWire {
     return string(string(algorithm) + string(string(r) + string(s)))
   }
 }
+
+/// Reads bounded SSH fields; truncated or oversized fields throw `invalidRequest`.
 public struct SSHReader {
   private let bytes: [UInt8]
   private var offset = 0
@@ -48,12 +59,14 @@ public struct SSHReader {
     defer { offset += 1 }
     return bytes[offset]
   }
+
   public mutating func uint32() throws -> UInt32 {
     guard bytes.count - offset >= 4 else { throw AgentError.invalidRequest }
     var result: UInt32 = 0
     for _ in 0..<4 { result = (result << 8) | UInt32(try byte()) }
     return result
   }
+
   public mutating func string() throws -> Data {
     let count = Int(try uint32())
     guard count <= SSHWire.maximumFrame, count <= bytes.count - offset else {
@@ -63,7 +76,20 @@ public struct SSHReader {
     return Data(bytes[offset..<offset + count])
   }
 }
+
+enum SSHAgentMessage: UInt8 {
+  case failure = 5
+  case requestIdentities = 11
+  case identities = 12
+  case signRequest = 13
+  case signResponse = 14
+
+  var payload: Data { Data([rawValue]) }
+}
+
+/// Handles identity and signing requests, returning failure for all other operations.
 public enum AgentProtocol {
+  static let failure = SSHAgentMessage.failure.payload
   /// Input is one bounded payload without its outer length. Only identity/sign operations are supported.
   public static func reply(
     to payload: Data, keyBlob: Data?, label: String, sign: (Data) throws -> Data
@@ -73,23 +99,26 @@ public enum AgentProtocol {
         throw AgentError.invalidRequest
       }
       var reader = SSHReader(payload)
-      switch try reader.byte() {
-      case 11:
+      switch SSHAgentMessage(rawValue: try reader.byte()) {
+      case .requestIdentities:
         guard reader.done else { throw AgentError.invalidRequest }
-        guard let keyBlob else { return Data([12]) + SSHWire.uint32(0) }
-        return Data([12]) + SSHWire.uint32(1) + SSHWire.string(keyBlob) + SSHWire.string(label)
-      case 13:
-        let requested = try reader.string()
+        guard let keyBlob else {
+          return SSHAgentMessage.identities.payload + SSHWire.uint32(0)
+        }
+        return SSHAgentMessage.identities.payload + SSHWire.uint32(1)
+          + SSHWire.string(keyBlob) + SSHWire.string(label)
+      case .signRequest:
+        let requestedKey = try reader.string()
         let data = try reader.string()
         let flags = try reader.uint32()
-        guard reader.done, flags == 0, let keyBlob, requested == keyBlob else {
+        guard reader.done, flags == 0, let keyBlob, requestedKey == keyBlob else {
           throw AgentError.invalidRequest
         }
-        return Data([14]) + (try SSHWire.signature(sign(data)))
+        return SSHAgentMessage.signResponse.payload + (try SSHWire.signature(sign(data)))
       default:
         // Includes add/remove/lock/forwarding extensions: never import keys.
-        return Data([5])
+        return failure
       }
-    } catch { return Data([5]) }
+    } catch { return failure }
   }
 }

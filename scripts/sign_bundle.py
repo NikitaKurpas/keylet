@@ -7,6 +7,7 @@ https://developer.apple.com/documentation/bundleresources/entitlements/com.apple
 https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.hardened-process.enhanced-security-version-string
 """
 import datetime as dt
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -21,6 +22,19 @@ import sys
 import tempfile
 
 IDENTIFIER = 'me.kurpas.keylet'
+
+
+@dataclass(frozen=True)
+class SigningPlan:
+    """Validated inputs shared by profile authorization and the signing commands."""
+    app: Path
+    profile_path: Path
+    team: str
+    identity: str
+    device_ids: frozenset
+    mode: str
+    keychain: str
+    entitlements: dict
 
 
 # Opt-in child/parent protocol: only these fixed numeric statuses cross the
@@ -94,8 +108,9 @@ def permits(pattern, value):
 
 
 def validate_profile(profile, *, team, identity, device_ids, now, mode='development'):
-    if mode not in ['development', 'developer-id']: raise SigningError('unknown_signing_mode', 'Unknown signing mode')
     """Pure metadata checks. CMS/platform authorization remains the OS's responsibility."""
+    if mode not in ['development', 'developer-id']:
+        raise SigningError('unknown_signing_mode', 'Unknown signing mode')
     if not isinstance(profile, dict):
         raise SigningError('profile_payload_invalid', 'Profile payload is not a property-list dictionary')
     expected = team + '.' + IDENTIFIER
@@ -235,47 +250,71 @@ def validate_identity(available, identity, mode):
 
 def signing_mode(environment):
     mode = environment.get('SIGNING_MODE') or 'development'
-    if mode not in ['development', 'developer-id']: raise SigningError('unknown_signing_mode', 'Unknown signing mode')
+    if mode not in ['development', 'developer-id']:
+        raise SigningError('unknown_signing_mode', 'Unknown signing mode')
     return mode
 
 
-def main():
-    mode = signing_mode(os.environ)
-    keychain = os.environ.get('SIGNING_KEYCHAIN', '')
-    profile_path, identity, team = inputs(os.environ)
+def require_supported_runtime():
     version = tuple(int(part) for part in platform.mac_ver()[0].split('.')[:2])
     if version < (26, 4):
         raise SigningError('unsupported_runtime', 'This version-2 policy requires macOS 26.4 or later')
-    root = Path(__file__).resolve().parent.parent
-    app = root / 'dist/Keylet.app'
-    validate_bundle(root,app)
-    if not profile_path.is_file():
-        raise SigningError('profile_file_unavailable', 'PROFILE must name a readable regular provisioning-profile file')
+
+
+def lookup_identity_and_devices(identity, mode, keychain):
     identity_command = ['/usr/bin/security', 'find-identity', '-v', '-p', 'codesigning']
-    if keychain: identity_command.append(keychain)
+    if keychain:
+        identity_command.append(keychain)
     available = command(identity_command, failure_code='identity_lookup_failed').decode()
     validate_identity(available, identity, mode)
-    device_ids = set()
     if mode == 'development':
         hardware = json.loads(command(['/usr/sbin/system_profiler', '-json', 'SPHardwareDataType'], failure_code='hardware_lookup_failed'))
-        device_ids = hardware_ids(hardware)
+        return hardware_ids(hardware)
+    return set()
+
+
+def load_signing_entitlements(root, team):
     template = plistlib.loads((root / 'packaging/Entitlements.plist.in').read_bytes())
-    entitlements = generated_entitlements(template, team)
-    # Read once and validate the exact bytes subsequently embedded; never leave decoded profile data behind.
-    with tempfile.TemporaryDirectory(prefix='sign-', dir=root / 'dist') as temporary:
+    return generated_entitlements(template, team)
+
+
+def sign_verified_bundle(plan):
+    """Validate the copied profile bytes before embedding and signing those same bytes."""
+    # Read once and validate the exact bytes subsequently embedded.
+    with tempfile.TemporaryDirectory(prefix='sign-', dir=plan.app.parent) as temporary:
         directory = Path(temporary)
         profile_copy = directory / 'profile.provisionprofile'
-        profile_copy.write_bytes(profile_path.read_bytes())
+        profile_copy.write_bytes(plan.profile_path.read_bytes())
         payload = plistlib.loads(command(['/usr/bin/security', 'cms', '-D', '-i', str(profile_copy)], failure_code='profile_cms_decode_failed'))
-        validate_profile(payload, team=team, identity=identity, device_ids=device_ids, now=dt.datetime.now(dt.timezone.utc), mode=mode)
+        validate_profile(payload, team=plan.team, identity=plan.identity, device_ids=plan.device_ids,
+                         now=dt.datetime.now(dt.timezone.utc), mode=plan.mode)
         signing_plist = directory / 'Entitlements.plist'
-        signing_plist.write_bytes(plistlib.dumps(entitlements))
-        shutil.copyfile(profile_copy, app / 'Contents/embedded.provisionprofile')
+        signing_plist.write_bytes(plistlib.dumps(plan.entitlements))
+        shutil.copyfile(profile_copy, plan.app / 'Contents/embedded.provisionprofile')
         # No shell interpolation, profile creation, certificate creation, keys or agent launch.
-        command(['/usr/bin/codesign', '--force', '--sign', identity, '--identifier', IDENTIFIER,
-            '--options', 'runtime', '--timestamp' if mode == 'developer-id' else '--timestamp=none',
-            '--entitlements', str(signing_plist)] + (['--keychain', keychain] if keychain else []) + [str(app)], capture=False, failure_code='codesign_failed')
-        command(['/usr/bin/codesign', '--verify', '--strict', '--verbose=2', str(app)], capture=False, failure_code='signature_verification_failed')
+        command(['/usr/bin/codesign', '--force', '--sign', plan.identity, '--identifier', IDENTIFIER,
+            '--options', 'runtime', '--timestamp' if plan.mode == 'developer-id' else '--timestamp=none',
+            '--entitlements', str(signing_plist)] + (['--keychain', plan.keychain] if plan.keychain else []) + [str(plan.app)], capture=False, failure_code='codesign_failed')
+        command(['/usr/bin/codesign', '--verify', '--strict', '--verbose=2', str(plan.app)], capture=False, failure_code='signature_verification_failed')
+
+
+def main():
+    """Validate bundle and signing authority before embedding a profile or signing."""
+    mode = signing_mode(os.environ)
+    keychain = os.environ.get('SIGNING_KEYCHAIN', '')
+    profile_path, identity, team = inputs(os.environ)
+    require_supported_runtime()
+    root = Path(__file__).resolve().parent.parent
+    app = root / 'dist/Keylet.app'
+    validate_bundle(root, app)
+    if not profile_path.is_file():
+        raise SigningError('profile_file_unavailable', 'PROFILE must name a readable regular provisioning-profile file')
+    device_ids = lookup_identity_and_devices(identity, mode, keychain)
+    entitlements = load_signing_entitlements(root, team)
+    plan = SigningPlan(app=app, profile_path=profile_path, team=team, identity=identity,
+                       device_ids=frozenset(device_ids), mode=mode, keychain=keychain,
+                       entitlements=entitlements)
+    sign_verified_bundle(plan)
     print('Signed and verified dist/Keylet.app. Run its executable with --json doctor; no key was created.')
 
 

@@ -55,6 +55,28 @@ private final class AuditFixture {
   var info = stat()
   #expect(lstat(fixture.path, &info) == 0 && info.st_mode & 0o777 == 0o600)
 }
+@Test func auditOptionalMetadataValidation() throws {
+  let fixture = try AuditFixture()
+  let store = try fixture.store()
+  for byteCount in [nil, 0, SSHWire.maximumFrame] as [Int?] {
+    try store.append(requestID: UUID(), action: "sign", outcome: "intent", byteCount: byteCount)
+  }
+  for byteCount in [-1, SSHWire.maximumFrame + 1] {
+    #expect(throws: AuditError.self) {
+      try store.append(requestID: UUID(), action: "sign", outcome: "intent", byteCount: byteCount)
+    }
+  }
+  for fingerprint in ["invalid", "SHA256:" + String(repeating: "a", count: 58)] {
+    #expect(throws: AuditError.self) {
+      try store.append(
+        requestID: UUID(), action: "sign", outcome: "intent", fingerprint: fingerprint)
+    }
+  }
+  #expect(throws: AuditError.self) {
+    try store.append(requestID: UUID(), action: "sign", outcome: "failure", errorCode: "unknown")
+  }
+  #expect(try store.list().count == 3)
+}
 @Test func auditPersistsAcrossReopenAndConcurrentConnections() throws {
   let fixture = try AuditFixture()
   do { try fixture.store().append(requestID: UUID(), action: "identities", outcome: "success") }
@@ -150,7 +172,7 @@ private final class AuditFixture {
   var outcomes: [String] = []
   var calls = 0
   let response = AuditedAgentProtocol.reply(
-    to: request, key: key, peer: AuditPeer(),
+    to: request, key: key,
     record: { outcome, _, _, _, _ in
       outcomes.append(outcome)
       if outcome == "success" { throw AuditError.unavailable }

@@ -123,3 +123,62 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
     #expect(throws: (any Error).self) { try SocketSafety.validate(path: path) }
   }
 }
+
+private func signingInformationFixture() -> [String: Any] {
+  [
+    kSecCodeInfoIdentifier as String: SigningContext.identifier,
+    kSecCodeInfoTeamIdentifier as String: "PUBLICTEAM",
+    kSecCodeInfoFlags as String: NSNumber(value: 0x10000),
+    kSecCodeInfoEntitlementsDict as String: [
+      "keychain-access-groups": ["PUBLICTEAM." + SigningContext.identifier],
+      "com.apple.security.app-sandbox": true,
+      "com.apple.security.hardened-process": true,
+      "com.apple.security.hardened-process.enhanced-security-version-string": "2",
+    ],
+  ]
+}
+
+@Test func signingMetadataRequiresEveryPolicyClaim() throws {
+  let information = signingInformationFixture()
+  #expect(
+    try SigningContext.validated(signingInformation: information).group
+      == "PUBLICTEAM.me.kurpas.keylet")
+  for field in information.keys {
+    var incomplete = information
+    incomplete.removeValue(forKey: field)
+    #expect(throws: AgentError.self) {
+      try SigningContext.validated(signingInformation: incomplete)
+    }
+  }
+  let entitlements = try #require(
+    information[kSecCodeInfoEntitlementsDict as String] as? [String: Any])
+  for field in entitlements.keys {
+    var incomplete = entitlements
+    incomplete.removeValue(forKey: field)
+    var invalid = information
+    invalid[kSecCodeInfoEntitlementsDict as String] = incomplete
+    #expect(throws: AgentError.self) { try SigningContext.validated(signingInformation: invalid) }
+  }
+}
+
+@Test func signingMetadataRejectsWrongGroupDebuggingAndRuntime() throws {
+  let information = signingInformationFixture()
+  let entitlements = try #require(
+    information[kSecCodeInfoEntitlementsDict as String] as? [String: Any])
+  for (field, value) in [
+    ("keychain-access-groups", ["OTHERTEAM.me.kurpas.keylet"] as Any),
+    ("com.apple.security.get-task-allow", true as Any),
+    ("com.apple.security.hardened-process.enhanced-security-version-string", "*" as Any),
+  ] {
+    var invalidEntitlements = entitlements
+    invalidEntitlements[field] = value
+    var invalid = information
+    invalid[kSecCodeInfoEntitlementsDict as String] = invalidEntitlements
+    #expect(throws: AgentError.self) { try SigningContext.validated(signingInformation: invalid) }
+  }
+  var unsignedRuntime = information
+  unsignedRuntime[kSecCodeInfoFlags as String] = NSNumber(value: 0)
+  #expect(throws: AgentError.self) {
+    try SigningContext.validated(signingInformation: unsignedRuntime)
+  }
+}

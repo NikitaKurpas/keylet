@@ -5,26 +5,25 @@ import Foundation
 public enum AuditedAgentProtocol {
   /// Records each request without storing its payload or signature.
   public static func reply(
-    to payload: Data, keys: [KeyRecord], peer: AuditPeer,
+    to payload: Data, keys: [KeyRecord],
     audit: AuditStore, sign: (Data, KeyRecord) throws -> Data
   ) -> Data {
     reply(
       to: payload, keys: keys,
-      record: { outcome, request, action, count, error, key in
+      record: { outcome, action, count, error, key in
         try audit.append(
-          requestID: request, action: action, outcome: outcome, keyID: key?.id,
+          action: action, outcome: outcome, keyID: key?.id,
           fingerprint: try key.map { SSHWire.fingerprint(try $0.blob()) }, byteCount: count,
-          peer: peer, errorCode: error)
+          errorCode: error)
       }, sign: sign)
   }
 
   // Inject persistence only for credential-free fault tests.
   static func reply(
     to payload: Data, keys: [KeyRecord],
-    record: (String, UUID, String, Int?, String?, KeyRecord?) throws -> Void,
+    record: (String, String, Int?, String?, KeyRecord?) throws -> Void,
     sign: (Data, KeyRecord) throws -> Data
   ) -> Data {
-    let requestID = UUID()
     let action = auditAction(for: payload)
     var signingAttempted = false
     let response = AgentProtocol.reply(to: payload, keys: keys) { data, key in
@@ -32,7 +31,7 @@ public enum AuditedAgentProtocol {
       return try auditedSignature(
         for: data, key: key,
         record: { outcome, errorCode in
-          try record(outcome, requestID, action, data.count, errorCode, key)
+          try record(outcome, action, data.count, errorCode, key)
         }, sign: { try sign($0, key) })
     }
     guard !signingAttempted else { return response }
@@ -40,7 +39,7 @@ public enum AuditedAgentProtocol {
     let rejected = response == AgentProtocol.failure
     do {
       try record(
-        rejected ? "rejected" : "success", requestID, action, nil,
+        rejected ? "rejected" : "success", action, nil,
         rejected ? "invalid-request" : nil, nil)
       return response
     } catch {

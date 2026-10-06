@@ -4,7 +4,6 @@ import Foundation
 /// Owns bounded client connections; request deadlines start at the first received byte.
 final class SocketSessions {
   private struct Connection {
-    var peer = AuditPeer()
     var receivedData = Data()
     var payloadLength: Int?
     var response = Data()
@@ -22,13 +21,13 @@ final class SocketSessions {
       bytesSent += bytesWritten
       if bytesSent == response.count {
         // Response complete: no idle deadline or request-count cutoff.
-        self = Connection(peer: peer)
+        self = Connection()
       }
     }
 
     mutating func readRequest(
       from fd: Int32, now: TimeInterval, timeout: TimeInterval,
-      reply: (Data, AuditPeer) -> Data
+      reply: (Data) -> Data
     ) throws {
       var bytes = [UInt8](repeating: 0, count: min(8192, remainingReadBytes))
       let bytesRead = bytes.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress!, $0.count) }
@@ -45,7 +44,7 @@ final class SocketSessions {
         payloadLength = payloadSize
         receivedData.removeAll(keepingCapacity: true)
       } else if let payloadLength, receivedData.count == payloadLength {
-        response = SSHWire.string(reply(receivedData, peer))
+        response = SSHWire.string(reply(receivedData))
         guard response.count <= SSHWire.maximumFrame + 4 else {
           throw AgentError.invalidRequest
         }
@@ -66,10 +65,11 @@ final class SocketSessions {
     guard connections.count < maximumConnections, connections[fd] == nil else {
       throw AgentError.unavailable
     }
-    connections[fd] = Connection(peer: try preparePeer(fd))
+    try prepareClient(fd)
+    connections[fd] = Connection()
   }
 
-  private func preparePeer(_ fd: Int32) throws -> AuditPeer {
+  private func prepareClient(_ fd: Int32) throws {
     var uid: uid_t = 0
     var gid: gid_t = 0
     var one: Int32 = 1
@@ -77,12 +77,6 @@ final class SocketSessions {
       fcntl(fd, F_SETFL, O_NONBLOCK) == 0,
       setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size)) == 0
     else { throw AgentError.unavailable }
-    var pid: Int32 = 0
-    var size = socklen_t(MemoryLayout<Int32>.size)
-    let hasPID =
-      getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &pid, &size) == 0
-      && size == socklen_t(MemoryLayout<Int32>.size) && pid > 0
-    return AuditPeer(uid: uid, gid: gid, pid: hasPID ? pid : nil)
   }
 
   func closeAll() {
@@ -96,12 +90,8 @@ final class SocketSessions {
     connections.removeValue(forKey: fd)
   }
 
-  func step(waitMilliseconds: Int32 = 100, reply: (Data) -> Data) throws {
-    try stepWithPeer(waitMilliseconds: waitMilliseconds) { payload, _ in reply(payload) }
-  }
-
   /// Polls once, advances ready clients, and closes expired or failed connections.
-  func stepWithPeer(waitMilliseconds: Int32 = 100, reply: (Data, AuditPeer) -> Data) throws {
+  func step(waitMilliseconds: Int32 = 100, reply: (Data) -> Data) throws {
     var descriptors = connections.map {
       pollfd(fd: $0.key, events: $0.value.pollEvents, revents: 0)
     }
@@ -115,7 +105,7 @@ final class SocketSessions {
     for descriptor in descriptors { service(descriptor, reply: reply) }
   }
 
-  private func service(_ descriptor: pollfd, reply: (Data, AuditPeer) -> Data) {
+  private func service(_ descriptor: pollfd, reply: (Data) -> Data) {
     let fd = descriptor.fd
     guard var connection = connections[fd] else { return }
     let now = ProcessInfo.processInfo.systemUptime

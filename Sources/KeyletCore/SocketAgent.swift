@@ -53,9 +53,9 @@ public enum SocketAgent {
     let stop = StopFlag()
     let signals = installSignalHandlers(listener: fd, stop: stop)
     defer { for source in signals { source.cancel() } }
-    try serve(listener: fd, stop: stop) { request, peer in
+    try serve(listener: fd, stop: stop) { request in
       let keys = store.inventory().agentKeys(id: id)
-      return AuditedAgentProtocol.reply(to: request, keys: keys, peer: peer, audit: audit) {
+      return AuditedAgentProtocol.reply(to: request, keys: keys, audit: audit) {
         data, record in
         return try store.sign(data, key: record)
       }
@@ -118,7 +118,7 @@ public enum SocketAgent {
   }
 
   private static func serve(
-    listener fd: Int32, stop: StopFlag, reply: (Data, AuditPeer) -> Data
+    listener fd: Int32, stop: StopFlag, reply: (Data) -> Data
   ) throws {
     let sessions = SocketSessions()
     defer { sessions.closeAll() }
@@ -135,7 +135,7 @@ public enum SocketAgent {
           throw AgentError.io(errno)
         }
       }
-      try sessions.stepWithPeer(reply: reply)
+      try sessions.step(reply: reply)
     }
   }
 }

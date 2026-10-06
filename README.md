@@ -105,7 +105,7 @@ keylet audit top --limit 10
 keylet --help
 ```
 
-Add `--json` for machine-readable results.
+Audit commands return readable JSON by default; add `--json` to other commands for machine-readable results. Logs keep the newest 10,000 events, including signing intents and outcomes. Use `audit list --before EVENT_ID` to page through older entries.
 
 ### Upgrade
 

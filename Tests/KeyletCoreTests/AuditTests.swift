@@ -22,6 +22,45 @@ private final class AuditFixture {
   func store(retention: Int = 10000) throws -> AuditStore {
     try AuditStore(directory: directory, retentionLimit: retention)
   }
+  func legacy() throws {
+    #expect(mkdir(directory, 0o700) == 0)
+    try sql(
+      """
+      CREATE TABLE events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,
+        request_id TEXT NOT NULL, action TEXT NOT NULL, outcome TEXT NOT NULL,
+        key_id TEXT, fingerprint TEXT, byte_count INTEGER,
+        peer_uid INTEGER, peer_gid INTEGER, peer_pid INTEGER, peer_identity TEXT NOT NULL,
+        error_code TEXT);
+      CREATE INDEX events_key_outcome ON events(key_id, outcome, id);
+      PRAGMA user_version=1;
+      INSERT INTO events VALUES(9,'2026-10-06T00:00:00Z','old-request','sign','success',
+        '00000000-0000-0000-0000-000000000001','SHA256:fixture',10,123,456,789,'old-peer',NULL);
+      INSERT INTO events VALUES(100,'2026-10-06T00:00:00Z','old-request','identities','success',
+        NULL,NULL,NULL,NULL,NULL,NULL,'unavailable',NULL);
+      DELETE FROM events WHERE id=100;
+      """)
+    #expect(chmod(path, 0o600) == 0)
+  }
+
+  func strings(_ query: String) throws -> [String] {
+    var db: OpaquePointer?
+    var statement: OpaquePointer?
+    guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+      throw AuditError.unavailable
+    }
+    defer { sqlite3_close(db) }
+    guard sqlite3_prepare_v2(db, query, -1, &statement, nil) == SQLITE_OK else {
+      throw AuditError.unavailable
+    }
+    defer { sqlite3_finalize(statement) }
+    var values: [String] = []
+    while sqlite3_step(statement) == SQLITE_ROW {
+      values.append(String(cString: sqlite3_column_text(statement, 0)))
+    }
+    return values
+  }
+
   func sql(_ query: String) throws {
     var db: OpaquePointer?
     guard sqlite3_open(path, &db) == SQLITE_OK else { throw AuditError.unavailable }
@@ -34,12 +73,11 @@ private final class AuditFixture {
   let store = try fixture.store(retention: 4)
   let key = UUID()
   for _ in 0..<3 {
-    let request = UUID()
     try store.append(
-      requestID: request, action: "sign", outcome: "intent", keyID: key,
+      action: "sign", outcome: "intent", keyID: key,
       fingerprint: "SHA256:fixture", byteCount: 10)
     try store.append(
-      requestID: request, action: "sign", outcome: "success", keyID: key,
+      action: "sign", outcome: "success", keyID: key,
       fingerprint: "SHA256:fixture", byteCount: 10)
   }
   let first = try store.list(limit: 2)
@@ -48,7 +86,6 @@ private final class AuditFixture {
   #expect(first[0].id > first[1].id && first[1].id > second[0].id)
   #expect(try store.list().count == 4)
   #expect(try store.top().first?.count == 2)  // Success rows only, never double-count intent.
-  #expect(first[0].peerIdentity == "unavailable")
   #expect(throws: AuditError.self) { try store.list(limit: 201) }
   #expect(throws: AuditError.self) { try store.top(limit: 0) }
   #expect(throws: AuditError.self) { try store.list(before: -1) }
@@ -59,31 +96,31 @@ private final class AuditFixture {
   let fixture = try AuditFixture()
   let store = try fixture.store()
   for byteCount in [nil, 0, SSHWire.maximumFrame] as [Int?] {
-    try store.append(requestID: UUID(), action: "sign", outcome: "intent", byteCount: byteCount)
+    try store.append(action: "sign", outcome: "intent", byteCount: byteCount)
   }
   for byteCount in [-1, SSHWire.maximumFrame + 1] {
     #expect(throws: AuditError.self) {
-      try store.append(requestID: UUID(), action: "sign", outcome: "intent", byteCount: byteCount)
+      try store.append(action: "sign", outcome: "intent", byteCount: byteCount)
     }
   }
   for fingerprint in ["invalid", "SHA256:" + String(repeating: "a", count: 58)] {
     #expect(throws: AuditError.self) {
       try store.append(
-        requestID: UUID(), action: "sign", outcome: "intent", fingerprint: fingerprint)
+        action: "sign", outcome: "intent", fingerprint: fingerprint)
     }
   }
   #expect(throws: AuditError.self) {
-    try store.append(requestID: UUID(), action: "sign", outcome: "failure", errorCode: "unknown")
+    try store.append(action: "sign", outcome: "failure", errorCode: "unknown")
   }
   #expect(try store.list().count == 3)
 }
 @Test func auditPersistsAcrossReopenAndConcurrentConnections() throws {
   let fixture = try AuditFixture()
-  do { try fixture.store().append(requestID: UUID(), action: "identities", outcome: "success") }
+  do { try fixture.store().append(action: "identities", outcome: "success") }
   let first = try fixture.store()
   let second = try fixture.store()
   try first.append(
-    requestID: UUID(), action: "unsupported", outcome: "rejected", errorCode: "invalid-request")
+    action: "unsupported", outcome: "rejected", errorCode: "invalid-request")
   #expect(try second.list().count == 2)
 }
 @Test func auditRejectsUnsafeFilesAndDirectory() throws {
@@ -94,7 +131,7 @@ private final class AuditFixture {
   #expect(chmod(fixture.path, 0o600) == 0)
   #expect(link(fixture.path, fixture.root + "/link") == 0)
   #expect(throws: AuditError.self) {
-    try store.append(requestID: UUID(), action: "sign", outcome: "intent")
+    try store.append(action: "sign", outcome: "intent")
   }
   #expect(unlink(fixture.root + "/link") == 0)
   #expect(chmod(fixture.directory, 0o755) == 0)
@@ -126,7 +163,7 @@ private final class AuditFixture {
   #expect(sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK)
   let start = ProcessInfo.processInfo.systemUptime
   #expect(throws: AuditError.self) {
-    try store.append(requestID: UUID(), action: "sign", outcome: "intent")
+    try store.append(action: "sign", outcome: "intent")
   }
   #expect(ProcessInfo.processInfo.systemUptime - start < 2)
   #expect(sqlite3_exec(db, "ROLLBACK; PRAGMA user_version=99", nil, nil, nil) == SQLITE_OK)
@@ -143,7 +180,7 @@ private final class AuditFixture {
   var calls = 0
   let response = AuditedAgentProtocol.reply(
     to: request, keys: [key],
-    peer: AuditPeer(uid: 123, gid: 456, pid: 789), audit: store
+    audit: store
   ) { _, _ in
     calls += 1
     return Data(repeating: 1, count: 64)
@@ -151,14 +188,12 @@ private final class AuditFixture {
   #expect(response.first == 14 && calls == 1)
   let events = try store.list()
   #expect(events.map(\.outcome) == ["success", "intent"])
-  #expect(events[0].requestID == events[1].requestID)
-  #expect(events[0].peerPID == 789 && events[0].peerUID == 123)
   #expect(events[0].byteCount == "sensitive payload never logged".utf8.count)
   #expect(events[0].fingerprint == SSHWire.fingerprint(blob))
   let encoded = try JSONEncoder().encode(events)
   #expect(!String(decoding: encoded, as: UTF8.self).contains("sensitive payload"))
   #expect(chmod(fixture.path, 0o644) == 0)
-  let failed = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store) {
+  let failed = AuditedAgentProtocol.reply(to: request, keys: [key], audit: store) {
     _, _ in
     calls += 1
     return Data(repeating: 1, count: 64)
@@ -173,7 +208,7 @@ private final class AuditFixture {
   var calls = 0
   let response = AuditedAgentProtocol.reply(
     to: request, keys: [key],
-    record: { outcome, _, _, _, _, _ in
+    record: { outcome, _, _, _, _ in
       outcomes.append(outcome)
       if outcome == "success" { throw AuditError.unavailable }
     },
@@ -190,14 +225,12 @@ private final class AuditFixture {
   let key = record(.afterFirstUnlock)
   let request =
     Data([13]) + SSHWire.string(Data([1])) + SSHWire.string("fixture") + SSHWire.uint32(0)
-  let response = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
-  { _, _ in
+  let response = AuditedAgentProtocol.reply(to: request, keys: [key], audit: store) { _, _ in
     Issue.record("invalid request invoked signer")
     return Data(repeating: 1, count: 64)
   }
   #expect(response == Data([5]))
   #expect(try store.list().map(\.outcome) == ["rejected"])
-  #expect(try store.list().first?.peerPID == nil)
 }
 @Test func auditedSignerFailureRecordsFailureNotSuccess() throws {
   let fixture = try AuditFixture()
@@ -205,8 +238,7 @@ private final class AuditFixture {
   let key = record(.afterFirstUnlock)
   let request =
     Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
-  let response = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
-  { _, _ in
+  let response = AuditedAgentProtocol.reply(to: request, keys: [key], audit: store) { _, _ in
     throw AgentError.unavailable
   }
   #expect(response == Data([5]))
@@ -226,7 +258,7 @@ private final class AuditFixture {
     KeyRecord(id: UUID(), label: "other", policy: .whenUnlocked, publicKey: otherPublicKey),
   ]
   var identities = SSHReader(
-    AuditedAgentProtocol.reply(to: Data([11]), keys: keys, peer: AuditPeer(), audit: store) { _, _ in
+    AuditedAgentProtocol.reply(to: Data([11]), keys: keys, audit: store) { _, _ in
       Issue.record("identity request invoked signer")
       return Data()
     })
@@ -242,8 +274,8 @@ private final class AuditFixture {
   for key in keys {
     let request =
       Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
-    let response = AuditedAgentProtocol.reply(to: request, keys: keys, peer: AuditPeer(), audit: store)
-    { data, selected in
+    let response = AuditedAgentProtocol.reply(to: request, keys: keys, audit: store) {
+      data, selected in
       #expect(data == Data("fixture".utf8))
       #expect(selected == key)
       signed.append(selected.id)
@@ -254,36 +286,19 @@ private final class AuditFixture {
   #expect(signed == keys.map(\.id))
   let events = try store.list().filter { $0.action == "sign" && $0.outcome == "success" }
   #expect(events.map(\.keyID) == keys.reversed().map { $0.id.uuidString })
-  #expect(try events.map(\.fingerprint) == keys.reversed().map { SSHWire.fingerprint(try $0.blob()) })
+  #expect(
+    try events.map(\.fingerprint) == keys.reversed().map { SSHWire.fingerprint(try $0.blob()) })
 
   let excludedRequest =
     Data([13]) + SSHWire.string(try keys[1].blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
   let restricted = Inventory(keys: keys, unavailableClasses: []).agentKeys(id: keys[0].id)
   let response = AuditedAgentProtocol.reply(
-    to: excludedRequest, keys: restricted, peer: AuditPeer(), audit: store
+    to: excludedRequest, keys: restricted, audit: store
   ) { _, _ in
     Issue.record("excluded key invoked signer")
     return Data()
   }
   #expect(response == Data([5]))
-}
-@Test func socketAuditPeerSnapshotSurvivesRetainedRequests() throws {
-  let sessions = SocketSessions()
-  let pair = try Pair()
-  try attach(pair, to: sessions)
-  var peers: [AuditPeer] = []
-  for _ in 0..<2 {
-    try pair.send(SSHWire.string(Data([11])))
-    for _ in 0..<6 {
-      try sessions.stepWithPeer(waitMilliseconds: 0) { _, peer in
-        peers.append(peer)
-        return Data([12, 0, 0, 0, 0])
-      }
-    }
-    _ = try SocketIO.readFrame(pair.writer, deadline: ProcessInfo.processInfo.systemUptime + 1)
-  }
-  #expect(peers.count == 2 && peers[0] == peers[1])
-  #expect(peers[0].uid == geteuid() && peers[0].gid != nil)
 }
 @Test func auditReadOnlyMissingAndExistingNeverCreatesOrMigrates() throws {
   let fixture = try AuditFixture()
@@ -291,11 +306,11 @@ private final class AuditFixture {
   #expect(try missing.list().isEmpty && missing.top().isEmpty)
   #expect(!FileManager.default.fileExists(atPath: fixture.directory))
   let writer = try fixture.store()
-  try writer.append(requestID: UUID(), action: "identities", outcome: "success")
+  try writer.append(action: "identities", outcome: "success")
   let reader = try AuditStore(directory: fixture.directory, readOnly: true)
   #expect(try reader.list().count == 1)
   #expect(throws: AuditError.self) {
-    try reader.append(requestID: UUID(), action: "identities", outcome: "success")
+    try reader.append(action: "identities", outcome: "success")
   }
   try fixture.sql("PRAGMA user_version=0")
   #expect(throws: AuditError.self) { try AuditStore(directory: fixture.directory, readOnly: true) }
@@ -322,10 +337,7 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
 @Test func auditRejectsWALReadAndMalformedPersistedMetadata() throws {
   let fixture = try AuditFixture()
   let writer = try fixture.store()
-  try writer.append(requestID: UUID(), action: "sign", outcome: "success")
-  try fixture.sql("UPDATE events SET peer_uid=-99, peer_pid=9223372036854775807")
-  #expect(try writer.list().first?.peerUID == nil)
-  #expect(try writer.list().first?.peerPID == nil)
+  try writer.append(action: "sign", outcome: "success")
   try fixture.sql("UPDATE events SET action=zeroblob(1000)")
   #expect(throws: AuditError.self) { try writer.list() }
   try fixture.sql("PRAGMA journal_mode=WAL")
@@ -343,7 +355,7 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
     + SSHWire.uint32(0)
   for (request, record) in [(invalid, key), (Data([17]), key), (validInteractive, interactive)] {
     let response = AuditedAgentProtocol.reply(
-      to: request, keys: [record], peer: AuditPeer(), audit: store
+      to: request, keys: [record], audit: store
     ) { _, _ in
       Issue.record("rejected request invoked signer")
       return Data(repeating: 1, count: 64)
@@ -365,12 +377,132 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
     let request =
       Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
     var signed = false
-    let result = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
-    { _, _ in
+    let result = AuditedAgentProtocol.reply(to: request, keys: [key], audit: store) { _, _ in
       signed = true
       return Data(repeating: 1, count: 64)
     }
     #expect(result == Data([5]) && !signed)
     #expect(try store.list().isEmpty)
   }
+}
+
+@Test func auditMigrationPreservesEventsCursorsAndSequence() throws {
+  let fixture = try AuditFixture()
+  try fixture.legacy()
+  let reader = try AuditStore(directory: fixture.directory, readOnly: true)
+  let original = try reader.list()
+  #expect(original.count == 1 && original[0].id == 9)
+  #expect(sqliteSchemaVersion(fixture.path) == 1)  // Read-only access does not migrate.
+  let store = try fixture.store()
+  #expect(sqliteSchemaVersion(fixture.path) == 2)
+  #expect(
+    try fixture.strings("SELECT name FROM pragma_table_info('events')") == [
+      "id", "timestamp", "action", "outcome", "key_id", "fingerprint", "byte_count", "error_code",
+    ])
+  #expect(
+    try fixture.strings("SELECT name FROM pragma_index_list('events')") == ["events_key_outcome"])
+  let migrated = try store.list()
+  #expect(migrated[0].timestamp == original[0].timestamp)
+  #expect(migrated[0].action == "sign" && migrated[0].outcome == "success")
+  #expect(migrated[0].keyID == original[0].keyID && migrated[0].fingerprint == "SHA256:fixture")
+  #expect(migrated[0].byteCount == 10 && migrated[0].errorCode == nil)
+  #expect(try store.append(action: "identities", outcome: "success") == 101)
+  #expect(try reader.list(before: 101).map(\.id) == [9])
+  #expect(try store.top().first?.count == 1)
+  #expect(try fixture.store().list().count == 2)  // Reopening schema 2 is idempotent.
+}
+
+@Test func auditMigrationFailureRollsBackAllColumnDrops() throws {
+  let fixture = try AuditFixture()
+  try fixture.legacy()
+  // This dependency makes a later DROP fail after request_id and peer_uid were dropped.
+  try fixture.sql("CREATE INDEX incompatible_peer ON events(peer_gid)")
+  #expect(throws: AuditError.self) { try fixture.store() }
+  #expect(sqliteSchemaVersion(fixture.path) == 1)
+  #expect(
+    try fixture.strings("SELECT request_id || ':' || peer_uid || ':' || peer_identity FROM events")
+      == ["old-request:123:old-peer"])
+  #expect(try AuditStore(directory: fixture.directory, readOnly: true).list().map(\.id) == [9])
+}
+
+@Test func auditDefaultRetentionAndExclusivePaginationAfterOverflow() throws {
+  let fixture = try AuditFixture()
+  let store = try fixture.store()
+  // Seed efficiently; production append must enforce its existing 10,000-row default.
+  try fixture.sql(
+    """
+    WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<10001)
+    INSERT INTO events(timestamp,action,outcome)
+      SELECT '2026-10-06T00:00:00Z','identities','success' FROM numbers;
+    """)
+  let newest = try store.append(action: "identities", outcome: "success")
+  #expect(newest == 10002)
+  let first = try store.list(limit: 200)
+  #expect(first.first?.id == newest)
+  try store.append(action: "identities", outcome: "success")
+  var ids = first.map(\.id)
+  while let cursor = ids.last {
+    let page = try store.list(limit: 200, before: cursor)
+    if page.isEmpty { break }
+    ids.append(contentsOf: page.map(\.id))
+  }
+  #expect(ids == Array((4...10002).reversed()).map(Int64.init))
+  #expect(try fixture.strings("SELECT COUNT(*) FROM events") == ["10000"])
+  #expect(try store.list(before: 4).isEmpty)
+}
+
+@Test func auditMigrationPrunesExistingOverflow() throws {
+  let fixture = try AuditFixture()
+  try fixture.legacy()
+  try fixture.sql(
+    """
+    WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<10001)
+    INSERT INTO events(timestamp,request_id,action,outcome,peer_identity)
+      SELECT '2026-10-06T00:00:00Z','old-request','identities','success','unavailable' FROM numbers;
+    """)
+  let store = try fixture.store()
+  #expect(sqliteSchemaVersion(fixture.path) == 2)
+  #expect(try fixture.strings("SELECT COUNT(*) FROM events") == ["10000"])
+  #expect(try store.list(limit: 1).first?.id == 10101)
+  #expect(try store.list(before: 102).isEmpty)
+}
+
+@Test func auditCommitFailureRollsBackInsertionAndPruning() throws {
+  let fixture = try AuditFixture()
+  let store = try fixture.store(retention: 2)
+  try store.append(action: "identities", outcome: "success")
+  try store.append(action: "identities", outcome: "success")
+  let original = try store.list().map(\.id)
+  var reader: OpaquePointer?
+  #expect(sqlite3_open_v2(fixture.path, &reader, SQLITE_OPEN_READONLY, nil) == SQLITE_OK)
+  defer { sqlite3_close(reader) }
+  // A shared read lock allows INSERT and pruning but prevents COMMIT's exclusive lock.
+  #expect(sqlite3_exec(reader, "BEGIN; SELECT * FROM events", nil, nil, nil) == SQLITE_OK)
+  #expect(throws: AuditError.self) {
+    try store.append(action: "identities", outcome: "success")
+  }
+  #expect(try store.list().map(\.id) == original)
+  #expect(sqlite3_exec(reader, "ROLLBACK", nil, nil, nil) == SQLITE_OK)
+  #expect(try store.append(action: "identities", outcome: "success") == 3)
+  #expect(try store.list().map(\.id) == [3, 2])
+}
+
+@Test func auditEventsContainOnlyRetainedFields() throws {
+  let fixture = try AuditFixture()
+  let store = try fixture.store()
+  let key = UUID()
+  try store.append(
+    action: "sign", outcome: "failure", keyID: key,
+    fingerprint: "SHA256:fixture", byteCount: 10, errorCode: "signing-unavailable")
+  let encoder = JSONEncoder()
+  encoder.keyEncodingStrategy = .convertToSnakeCase
+  let rows = try #require(
+    JSONSerialization.jsonObject(with: encoder.encode(store.list())) as? [[String: Any]])
+  #expect(
+    Set(rows[0].keys)
+      == Set([
+        "id", "timestamp", "action", "outcome", "key_id", "fingerprint", "byte_count", "error_code",
+      ]))
+  #expect(rows[0]["key_id"] as? String == key.uuidString)
+  #expect(rows[0]["outcome"] as? String == "failure")
 }

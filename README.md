@@ -68,18 +68,15 @@ The service serves all unattended keys. To run in the foreground, use `keylet ag
 
 ### Delete a key
 
-Resolve the UUID with `keylet keys list` (or `keylet keys resolve --label 'Exact label'`), inspect the preview, then repeat that UUID to confirm:
+List keys to find the UUID, preview deletion, then repeat the UUID to confirm:
 
 ```sh
-keylet keys delete --id KEY_UUID --dry-run --json
-keylet keys delete --id KEY_UUID --confirm-id KEY_UUID --json
+keylet keys list
+keylet keys delete --id KEY_UUID --dry-run
+keylet keys delete --id KEY_UUID --confirm-id KEY_UUID
 ```
 
-Deletion is permanent. Secure Enclave keys cannot be exported, backed up or restored. The command accepts one full UUID, refuses missing or ambiguous matches and incomplete inventories, and deletes only the matching item in Keylet's dedicated Keychain service and access group. It never prompts; without `--dry-run`, a matching `--confirm-id` is required, including in JSON mode. Preview reads public metadata from the Keychain and requires the signed app and accessible protection classes.
-
-The current agent reloads inventory on every request and the stored key before signing, so later requests stop using a deleted key without a restart. A signature already in progress may finish. Restart older agents that cache keys (for the Homebrew service: `brew services restart keylet`). Deleting the local item does not remove public-key authorizations on GitHub or other servers; remove those separately when retiring the identity.
-
-With `--json`, success exits 0 and returns `ok`, `dry_run`, `key_deleted`, public `key` metadata and `warning`. Failure exits 1 and returns `{"ok":false,"error":{"code":"...","message":"..."}}`; no confirmation text is read from stdin. Resolution errors use `key_not_found`, `key_ambiguous` or `key_inventory_incomplete`; Keychain failures retain the existing `keychain_<status>` codes. `key_deleted: true` reports removal of the stored item, not completion of in-flight work or remote revocation.
+Deletion is permanent; Secure Enclave keys cannot be backed up or restored. A signature already in progress may finish. Remove the public key from remote accounts separately; restart older agents that cache keys.
 
 ### GitHub
 

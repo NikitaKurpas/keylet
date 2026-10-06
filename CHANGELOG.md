@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/NikitaKurpas/keylet/compare/v0.3.0...v0.3.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* clarify doctor checks and resolve bundled CLI version ([afb608b](https://github.com/NikitaKurpas/keylet/commit/afb608b5ede31fa0ee2b5d37f6420beac77370b9))
+* clarify doctor checks and resolve bundled CLI version ([0f05b1e](https://github.com/NikitaKurpas/keylet/commit/0f05b1ee08b51071ccf30423ecd863fd790a91a8))
+
 ## [0.3.0](https://github.com/NikitaKurpas/keylet/compare/v0.2.0...v0.3.0) (2026-10-06)
 
 

@@ -143,13 +143,7 @@ dist/Keylet.app/Contents/MacOS/keylet doctor
 
 ### Releases
 
-[Release Please](https://github.com/googleapis/release-please-action) updates a version and changelog PR after successful `main` CI. Use Conventional Commits (`fix:` for patches, `feat:` for minor versions, `!` for breaking changes). Review the generated PR and merge it when ready to publish; ordinary feature merges do not publish releases.
-
-If GitHub shows **Approve workflows to run** on the bot PR, approve its checks before merging. The repository must allow **Settings → Actions → General → Allow GitHub Actions to create and approve pull requests**; enabling this setting requires the repository owner's decision. No new token is needed.
-
-Merging the release PR creates a hidden draft and version tag, then explicitly dispatches **Release** using `GITHUB_TOKEN`. Release requires successful `main` CI for that exact commit, tests the tagged source, signs and notarizes the build, uploads verified assets, publishes, and updates the Homebrew tap using the existing release environment credentials. Automatic tags are created by GitHub Actions rather than signed with the maintainer’s local Keylet key. The tag event alone cannot start this workflow when created by `GITHUB_TOKEN`.
-
-For recovery, run **Release** on `main` with the existing tag. Draft retries replace unfinished assets; published releases reuse their original archive and checksum after verifying the configured Developer ID certificate, signature, and notarization. If that certificate has since changed, recovery fails closed. An older recovery cannot downgrade an existing newer tap formula. If dispatch fails after the draft is created, dispatch **Release** directly; rerunning **Release PR** does not redispatch an existing draft. Manual trusted tags remain supported, but routine releases only need the release PR merge.
+After successful `main` CI, Release Please prepares a version and changelog PR. Merge it to publish a signed, notarized release and update Homebrew. See [RELEASE.md](RELEASE.md) for setup and recovery.
 
 ## Maintainers
 

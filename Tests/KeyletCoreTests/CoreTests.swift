@@ -45,7 +45,7 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
   let message = Data("public test message".utf8)
   let request = Data([13]) + SSHWire.string(blob) + SSHWire.string(message) + SSHWire.uint32(0)
   var calls = 0
-  let response = AgentProtocol.reply(to: request, keyBlob: blob, label: "fixture") { data in
+  let response = AgentProtocol.reply(to: request, keys: [record(.afterFirstUnlock)]) { data, _ in
     calls += 1
     #expect(data == message)
     return Data(repeating: 1, count: 64)
@@ -53,7 +53,7 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
   #expect(calls == 1)
   #expect(response.first == 14)
   #expect(
-    AgentProtocol.reply(to: Data([11]), keyBlob: nil, label: "") { _ in fatalError() }
+    AgentProtocol.reply(to: Data([11]), keys: []) { _, _ in fatalError() }
       == Data([12, 0, 0, 0, 0]))
 }
 @Test func rejectedRequestsNeverSign() throws {
@@ -70,7 +70,7 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
   for length in 0..<valid.count { invalid.append(Data(valid.prefix(length))) }
   for input in invalid {
     #expect(
-      AgentProtocol.reply(to: input, keyBlob: blob, label: "") { _ in
+      AgentProtocol.reply(to: input, keys: [record(.afterFirstUnlock)]) { _, _ in
         Issue.record("Unexpected signing call")
         return Data()
       } == Data([5]))
@@ -81,7 +81,7 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
   #expect(throws: (any Error).self) { try reader.string() }
   for size in 0..<1024 {
     let data = Data((0..<size).map { UInt8(truncatingIfNeeded: $0 &* 31 &+ size) })
-    _ = AgentProtocol.reply(to: data, keyBlob: nil, label: "") { _ in
+    _ = AgentProtocol.reply(to: data, keys: []) { _, _ in
       Issue.record("Unexpected sign")
       return Data()
     }
@@ -122,6 +122,18 @@ func record(_ policy: KeyPolicy) -> KeyRecord {
   for path in ["relative", "/a\0b", "/" + String(repeating: "x", count: 104)] {
     #expect(throws: (any Error).self) { try SocketSafety.validate(path: path) }
   }
+}
+
+@Test func agentKeySelectionIncludesAllAvailableUnattendedKeys() {
+  let unattended = record(.afterFirstUnlock)
+  let unlocked = KeyRecord(id: UUID(), label: "other", policy: .whenUnlocked, publicKey: publicFixture)
+  let inventory = Inventory(keys: [unattended, unlocked, record(.userPresence)], unavailableClasses: [])
+  #expect(inventory.agentKeys() == [unattended, unlocked])
+  #expect(inventory.agentKeys(id: unlocked.id) == [unlocked])
+  #expect(inventory.agentKeys(id: UUID()).isEmpty)
+  #expect(Inventory(keys: [], unavailableClasses: []).agentKeys().isEmpty)
+  #expect(
+    Inventory(keys: [unattended], unavailableClasses: ["when-unlocked"]).agentKeys() == [unattended])
 }
 
 private func signingInformationFixture() -> [String: Any] {

@@ -142,9 +142,9 @@ private final class AuditFixture {
     + SSHWire.uint32(0)
   var calls = 0
   let response = AuditedAgentProtocol.reply(
-    to: request, key: key,
+    to: request, keys: [key],
     peer: AuditPeer(uid: 123, gid: 456, pid: 789), audit: store
-  ) { _ in
+  ) { _, _ in
     calls += 1
     return Data(repeating: 1, count: 64)
   }
@@ -158,8 +158,8 @@ private final class AuditFixture {
   let encoded = try JSONEncoder().encode(events)
   #expect(!String(decoding: encoded, as: UTF8.self).contains("sensitive payload"))
   #expect(chmod(fixture.path, 0o644) == 0)
-  let failed = AuditedAgentProtocol.reply(to: request, key: key, peer: AuditPeer(), audit: store) {
-    _ in
+  let failed = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store) {
+    _, _ in
     calls += 1
     return Data(repeating: 1, count: 64)
   }
@@ -172,12 +172,12 @@ private final class AuditFixture {
   var outcomes: [String] = []
   var calls = 0
   let response = AuditedAgentProtocol.reply(
-    to: request, key: key,
-    record: { outcome, _, _, _, _ in
+    to: request, keys: [key],
+    record: { outcome, _, _, _, _, _ in
       outcomes.append(outcome)
       if outcome == "success" { throw AuditError.unavailable }
     },
-    sign: { _ in
+    sign: { _, _ in
       calls += 1
       return Data(repeating: 1, count: 64)
     })
@@ -190,8 +190,8 @@ private final class AuditFixture {
   let key = record(.afterFirstUnlock)
   let request =
     Data([13]) + SSHWire.string(Data([1])) + SSHWire.string("fixture") + SSHWire.uint32(0)
-  let response = AuditedAgentProtocol.reply(to: request, key: key, peer: AuditPeer(), audit: store)
-  { _ in
+  let response = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
+  { _, _ in
     Issue.record("invalid request invoked signer")
     return Data(repeating: 1, count: 64)
   }
@@ -205,13 +205,67 @@ private final class AuditFixture {
   let key = record(.afterFirstUnlock)
   let request =
     Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
-  let response = AuditedAgentProtocol.reply(to: request, key: key, peer: AuditPeer(), audit: store)
-  { _ in
+  let response = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
+  { _, _ in
     throw AgentError.unavailable
   }
   #expect(response == Data([5]))
   #expect(try store.list().map(\.outcome) == ["failure", "intent"])
   #expect(try store.top().isEmpty)
+}
+
+@Test func multipleAgentKeysListSignAndAuditTheRequestedKey() throws {
+  let fixture = try AuditFixture()
+  let store = try fixture.store()
+  // SEC1 encoding of the public P256 generator point; no private key is created.
+  let otherPublicKey = Data(
+    base64Encoded:
+      "BGsX0fLhLEJH+Lzm5WOkQPJ3A32BLeszoPShOUXYmMKWT+NC4v4af5uO5+tKfA+eFivOM1drMV7Oy7ZAaDe/UfU=")!
+  let keys = [
+    record(.afterFirstUnlock),
+    KeyRecord(id: UUID(), label: "other", policy: .whenUnlocked, publicKey: otherPublicKey),
+  ]
+  var identities = SSHReader(
+    AuditedAgentProtocol.reply(to: Data([11]), keys: keys, peer: AuditPeer(), audit: store) { _, _ in
+      Issue.record("identity request invoked signer")
+      return Data()
+    })
+  #expect(try identities.byte() == 12)
+  #expect(try identities.uint32() == 2)
+  for key in keys {
+    #expect(try identities.string() == key.blob())
+    #expect(try identities.string() == Data(key.label.utf8))
+  }
+  #expect(identities.done)
+
+  var signed: [UUID] = []
+  for key in keys {
+    let request =
+      Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
+    let response = AuditedAgentProtocol.reply(to: request, keys: keys, peer: AuditPeer(), audit: store)
+    { data, selected in
+      #expect(data == Data("fixture".utf8))
+      #expect(selected == key)
+      signed.append(selected.id)
+      return Data(repeating: 1, count: 64)
+    }
+    #expect(response.first == 14)
+  }
+  #expect(signed == keys.map(\.id))
+  let events = try store.list().filter { $0.action == "sign" && $0.outcome == "success" }
+  #expect(events.map(\.keyID) == keys.reversed().map { $0.id.uuidString })
+  #expect(try events.map(\.fingerprint) == keys.reversed().map { SSHWire.fingerprint(try $0.blob()) })
+
+  let excludedRequest =
+    Data([13]) + SSHWire.string(try keys[1].blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
+  let restricted = Inventory(keys: keys, unavailableClasses: []).agentKeys(id: keys[0].id)
+  let response = AuditedAgentProtocol.reply(
+    to: excludedRequest, keys: restricted, peer: AuditPeer(), audit: store
+  ) { _, _ in
+    Issue.record("excluded key invoked signer")
+    return Data()
+  }
+  #expect(response == Data([5]))
 }
 @Test func socketAuditPeerSnapshotSurvivesRetainedRequests() throws {
   let sessions = SocketSessions()
@@ -289,8 +343,8 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
     + SSHWire.uint32(0)
   for (request, record) in [(invalid, key), (Data([17]), key), (validInteractive, interactive)] {
     let response = AuditedAgentProtocol.reply(
-      to: request, key: record, peer: AuditPeer(), audit: store
-    ) { _ in
+      to: request, keys: [record], peer: AuditPeer(), audit: store
+    ) { _, _ in
       Issue.record("rejected request invoked signer")
       return Data(repeating: 1, count: 64)
     }
@@ -311,8 +365,8 @@ private func sqliteSchemaVersion(_ path: String) -> Int32 {
     let request =
       Data([13]) + SSHWire.string(try key.blob()) + SSHWire.string("fixture") + SSHWire.uint32(0)
     var signed = false
-    let result = AuditedAgentProtocol.reply(to: request, key: key, peer: AuditPeer(), audit: store)
-    { _ in
+    let result = AuditedAgentProtocol.reply(to: request, keys: [key], peer: AuditPeer(), audit: store)
+    { _, _ in
       signed = true
       return Data(repeating: 1, count: 64)
     }

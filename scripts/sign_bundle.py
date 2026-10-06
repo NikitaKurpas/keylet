@@ -214,7 +214,8 @@ def validate_bundle(root, app):
         raise SigningError('bundle_invalid', 'Use regular bundle directories produced by make bundle; symlinks are refused')
     info = app / 'Contents/Info.plist'
     binary = app / 'Contents/MacOS/keylet'
-    files = [info, binary, app / 'Contents/Resources/LICENSE', app / 'Contents/Resources/NOTICE.md']
+    helper = app / 'Contents/Resources/keylet-ssh-sign'
+    files = [info, binary, helper, app / 'Contents/Resources/LICENSE', app / 'Contents/Resources/NOTICE.md']
     if any(path.is_symlink() or not path.is_file() for path in files):
         raise SigningError('bundle_invalid', 'Bundle inputs must be regular files; symlinks are refused')
     embedded = app / 'Contents/embedded.provisionprofile'
@@ -238,6 +239,9 @@ def validate_bundle(root, app):
     license_copy = app / 'Contents/Resources/Licenses/swift-argument-parser-LICENSE.txt'
     if not license_source.is_file() or not license_copy.is_file() or license_copy.read_bytes() != license_source.read_bytes():
         raise SigningError('bundle_invalid', 'Bundle must contain unchanged swift-argument-parser license')
+    helper_source = root / 'packaging/keylet-ssh-sign'
+    if not helper_source.is_file() or helper.read_bytes() != helper_source.read_bytes() or not helper.stat().st_mode & stat.S_IXUSR:
+        raise SigningError('bundle_invalid', 'Bundle must contain unchanged executable keylet-ssh-sign')
 
 
 def validate_identity(available, identity, mode):

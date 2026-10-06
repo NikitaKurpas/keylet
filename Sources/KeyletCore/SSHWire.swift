@@ -92,7 +92,7 @@ public enum AgentProtocol {
   static let failure = SSHAgentMessage.failure.payload
   /// Input is one bounded payload without its outer length. Only identity/sign operations are supported.
   public static func reply(
-    to payload: Data, keyBlob: Data?, label: String, sign: (Data) throws -> Data
+    to payload: Data, keys: [KeyRecord], sign: (Data, KeyRecord) throws -> Data
   ) -> Data {
     do {
       guard !payload.isEmpty, payload.count <= SSHWire.maximumFrame else {
@@ -102,19 +102,22 @@ public enum AgentProtocol {
       switch SSHAgentMessage(rawValue: try reader.byte()) {
       case .requestIdentities:
         guard reader.done else { throw AgentError.invalidRequest }
-        guard let keyBlob else {
-          return SSHAgentMessage.identities.payload + SSHWire.uint32(0)
+        var response = SSHAgentMessage.identities.payload + SSHWire.uint32(UInt32(keys.count))
+        for key in keys {
+          response += SSHWire.string(try key.blob()) + SSHWire.string(key.label)
+          guard response.count <= SSHWire.maximumFrame else { throw AgentError.invalidRequest }
         }
-        return SSHAgentMessage.identities.payload + SSHWire.uint32(1)
-          + SSHWire.string(keyBlob) + SSHWire.string(label)
+        return response
       case .signRequest:
         let requestedKey = try reader.string()
         let data = try reader.string()
         let flags = try reader.uint32()
-        guard reader.done, flags == 0, let keyBlob, requestedKey == keyBlob else {
+        guard reader.done, flags == 0,
+          let key = try keys.first(where: { try $0.blob() == requestedKey })
+        else {
           throw AgentError.invalidRequest
         }
-        return SSHAgentMessage.signResponse.payload + (try SSHWire.signature(sign(data)))
+        return SSHAgentMessage.signResponse.payload + (try SSHWire.signature(sign(data, key)))
       default:
         // Includes add/remove/lock/forwarding extensions: never import keys.
         return failure

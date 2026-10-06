@@ -37,6 +37,7 @@ def bundle(root, binary):
     if (destination / 'Contents/embedded.provisionprofile').exists() or (destination / 'Contents/_CodeSignature').exists():
         raise ValueError('Unsigned review destination must not contain signed artifacts')
     copies = [(root / 'packaging/Info.plist', destination / 'Contents/Info.plist'),
+              (root / 'packaging/keylet-ssh-sign', destination / 'Contents/Resources/keylet-ssh-sign'),
               (binary, destination / 'Contents/MacOS/keylet'),
               *[(root / name, destination / 'Contents/Resources' / name) for name in ['LICENSE', 'NOTICE.md']],
               (root / 'licenses/swift-argument-parser-LICENSE.txt', destination / 'Contents/Resources/Licenses/swift-argument-parser-LICENSE.txt')]
@@ -45,7 +46,7 @@ def bundle(root, binary):
         if target.exists(): regular(target)
     for source, target in copies:
         shutil.copyfile(source, target)
-        target.chmod(0o755 if target.name == 'keylet' else 0o644)
+        target.chmod(0o755 if target.name in ('keylet', 'keylet-ssh-sign') else 0o644)
     return destination
 
 

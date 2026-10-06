@@ -3,7 +3,10 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import socket
+import struct
 import tempfile
+import threading
 import unittest
 import release
 
@@ -37,6 +40,12 @@ module Kernel
     File.write(ENV.fetch("DEST")+"/verification-requested", "strict")
     ENV["VERIFY_FAIL"] != "1"
   end
+  def exec(*args)
+    expected = File.join(ENV.fetch("DEST"), "libexec/Keylet.app/Contents/MacOS/keylet")
+    raise "Unexpected executable or arguments" unless File.realpath(args.first) == File.realpath(expected) && args.drop(1) == ["agent"]
+    File.write(ENV.fetch("DEST")+"/launch-requested", "agent")
+    exit 0
+  end
 end
 class Formula
   def self.test(&block); define_method(:test, &block); end
@@ -60,6 +69,7 @@ class Formula
   def odie(message); raise message; end
 end
 load ARGV.fetch(0)
+ARGV.clear
 raise "Verification ran at formula load" if File.exist?(ENV.fetch("DEST")+"/verification-requested")
 formula = Keylet.new
 formula.install
@@ -75,6 +85,15 @@ if ENV["TEST_TAMPER"] == "1"
 end
 ENV["VERIFY_FAIL"] = "1" if ENV["TEST_VERIFY_FAIL"] == "1"
 formula.test
+if ENV["RUN_SERVICE"] == "1"
+  if ENV["SERVICE_TAMPER"] == "1"
+    File.binwrite(formula.libexec/"Keylet.app/Contents/MacOS/keylet", "changed public fixture")
+  end
+  ENV["VERIFY_FAIL"] = "1" if ENV["SERVICE_VERIFY_FAIL"] == "1"
+  ARGV.replace(["agent"])
+  load (formula.libexec/"keylet-verify-install").to_s
+  raise "Service did not exec the agent"
+end
 '''
 
 class FormulaTests(unittest.TestCase):
@@ -87,30 +106,61 @@ class FormulaTests(unittest.TestCase):
                 contents = stage/('Contents' if flattened else 'Keylet.app/Contents')
                 (contents/'MacOS').mkdir(parents=True)
                 (contents/'MacOS/keylet').write_bytes(fixture)
+                (contents/'Resources').mkdir()
+                helper = contents/'Resources/keylet-ssh-sign'
+                helper.write_bytes((release.ROOT/'packaging/keylet-ssh-sign').read_bytes())
+                helper.chmod(0o755)
                 formula = root/'keylet.rb'
                 formula.write_text(release.formula_text('v1.2.3', 'owner/repo', 'a'*64, hashlib.sha256(fixture).hexdigest()))
                 harness = root/'harness.rb'
                 harness.write_text(HARNESS)
                 destination = root/'destination with spaces'
                 environment = dict(os.environ, STAGE=str(stage), DEST=str(destination))
-                subprocess.run(['/usr/bin/ruby', str(harness), str(formula)], cwd=stage, env=environment, check=True, capture_output=True)
+                subprocess.run(['/usr/bin/ruby', str(harness), str(formula)], cwd=stage,
+                    env=dict(environment, RUN_SERVICE='1'), check=True, capture_output=True)
                 self.assertEqual((destination/'libexec/Keylet.app/Contents/MacOS/keylet').read_bytes(), fixture)
                 self.assertTrue((destination/'verification-requested').is_file())
-                wrapper = destination/'bin/keylet-agent-service'
-                subprocess.run(['/bin/bash', '-n', str(wrapper)], check=True, capture_output=True)
-                for value in ['', 'bad', 'A'*36, '00000000-0000-0000-0000-000000000000;echo injected']:
-                    result = subprocess.run(['/bin/bash', str(wrapper)], env=dict(environment, KEYLET_KEY_ID=value), capture_output=True)
-                    self.assertEqual(result.returncode, 1)
-                    self.assertIn(b'Set KEYLET_KEY_ID', result.stderr)
-                # Valid UUID with changed public binary must stop before codesign/app execution.
+                wrapper = destination/'libexec/keylet-verify-install'
+                subprocess.run(['/usr/bin/ruby', '-c', str(wrapper)], check=True, capture_output=True)
+                self.assertEqual((destination/'launch-requested').read_text(), 'agent')
+                signer = destination/'bin/keylet-ssh-sign'
+                self.assertTrue(signer.is_symlink())
+                self.assertEqual(signer.resolve(), (destination/'libexec/Keylet.app/Contents/Resources/keylet-ssh-sign').resolve())
+                # The native signer must use Keylet's socket even with another agent in the environment.
+                with tempfile.TemporaryDirectory(dir='/tmp', prefix='kls-') as signing_home:
+                    socket_path = Path(signing_home)/'Library/Containers/me.kurpas.keylet/Data/agent/socket.ssh'
+                    socket_path.parent.mkdir(parents=True)
+                    public_key = Path(signing_home)/'public key.pub'
+                    public_key.write_text('ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOVEjgAA5PHqRgwykjN5qM21uWCHFSY/Sqo5gkHAkn+e1MMQKHOLga7ucB9b3mif33MBid59GRK9GEPVlMiSQwo= fixture\n')
+                    requests = []
+                    with socket.socket(socket.AF_UNIX) as listener:
+                        listener.bind(str(socket_path))
+                        listener.listen(1)
+                        listener.settimeout(5)
+                        def reject_identity():
+                            connection, _ = listener.accept()
+                            with connection, connection.makefile('rb') as stream:
+                                length = struct.unpack('>I', stream.read(4))[0]
+                                requests.append(stream.read(length))
+                                connection.sendall(bytes.fromhex('000000050c00000000'))
+                        server = threading.Thread(target=reject_identity, daemon=True)
+                        server.start()
+                        result = subprocess.run([str(signer), '-Y', 'sign', '-n', 'git', '-f', str(public_key)],
+                            input=b'public fixture', env=dict(environment, HOME=signing_home, SSH_AUTH_SOCK='/unused-agent'),
+                            capture_output=True, timeout=5)
+                        server.join(timeout=5)
+                        self.assertFalse(server.is_alive())
+                    self.assertEqual(requests, [b'\x0b'])
+                    self.assertNotEqual(result.returncode, 0)
+                # A changed binary must stop before codesign/app execution.
                 (destination/'libexec/Keylet.app/Contents/MacOS/keylet').write_bytes(b'changed public fixture')
-                result = subprocess.run(['/bin/bash', str(wrapper)], env=dict(environment, KEYLET_KEY_ID='00000000-0000-0000-0000-000000000000'), capture_output=True)
+                result = subprocess.run(['/usr/bin/ruby', str(wrapper), 'agent'], env=environment, capture_output=True)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn(b'binary differs', result.stderr)
+                self.assertIn(b'Homebrew changed the signed Keylet binary', result.stderr)
 
     def test_post_install_rejects_changed_digest_and_failed_signature(self):
         fixture = b'public non-executable fixture'
-        for fault in ['TAMPER', 'VERIFY_FAIL', 'TEST_TAMPER', 'TEST_VERIFY_FAIL']:
+        for fault in ['TAMPER', 'VERIFY_FAIL', 'TEST_TAMPER', 'TEST_VERIFY_FAIL', 'SERVICE_TAMPER', 'SERVICE_VERIFY_FAIL']:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 stage = root/'stage'
@@ -123,11 +173,12 @@ class FormulaTests(unittest.TestCase):
                 harness.write_text(HARNESS)
                 destination = root/'destination with spaces'
                 result = subprocess.run(['/usr/bin/ruby', str(harness), str(formula)], cwd=stage,
-                    env=dict(os.environ, STAGE=str(stage), DEST=str(destination), **{fault:'1'}), capture_output=True)
+                    env=dict(os.environ, STAGE=str(stage), DEST=str(destination), RUN_SERVICE='1', **{fault:'1'}), capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
-                if fault in ['TAMPER', 'TEST_TAMPER']:
+                self.assertFalse((destination/'launch-requested').exists())
+                if fault in ['TAMPER', 'TEST_TAMPER', 'SERVICE_TAMPER']:
                     self.assertIn(b'Homebrew changed the signed Keylet binary', result.stderr)
-                    self.assertEqual((destination/'verification-requested').exists(), fault == 'TEST_TAMPER')
+                    self.assertEqual((destination/'verification-requested').exists(), fault != 'TAMPER')
                 else:
                     self.assertIn(b'Keylet signature verification failed', result.stderr)
                     self.assertTrue((destination/'verification-requested').exists())

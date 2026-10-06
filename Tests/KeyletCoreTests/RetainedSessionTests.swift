@@ -33,7 +33,7 @@ func exchange(_ request: Data, pair: Pair, sessions: SocketSessions, reply: (Dat
   try attach(pair, to: sessions)
   var calls = 0
   let reply: (Data) -> Data = { request in
-    AgentProtocol.reply(to: request, keyBlob: blob, label: "public fixture") { _ in
+    AgentProtocol.reply(to: request, keys: [record(.afterFirstUnlock)]) { _, _ in
       calls += 1
       return Data(repeating: 1, count: 64)
     }

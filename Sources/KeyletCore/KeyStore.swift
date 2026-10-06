@@ -48,6 +48,11 @@ public struct Inventory: Sendable {
   public let keys: [KeyRecord]
   public let unavailableClasses: [String]
   public var complete: Bool { unavailableClasses.isEmpty }
+
+  /// Returns available unattended keys, optionally restricted to one UUID.
+  public func agentKeys(id: UUID? = nil) -> [KeyRecord] {
+    keys.filter { $0.policy != .userPresence && (id == nil || $0.id == id) }
+  }
 }
 
 /// Dedicated Keychain group derived from the running executable’s verified signature.

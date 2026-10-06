@@ -20,25 +20,7 @@ class Keylet < Formula
       odie "Release archive has no Keylet.app/Contents"
     end
     bin.install_symlink libexec/"Keylet.app/Contents/MacOS/keylet"
-    # External wrapper: never modify/re-sign anything inside the sealed bundle.
-    (bin/"keylet-agent-service").write <<~SH
-      #!/bin/bash
-      set -euo pipefail
-      key="${KEYLET_KEY_ID:-}"
-      if ! [[ "$key" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-        echo "Set KEYLET_KEY_ID to an existing Keylet UUID in Homebrew's user services/keylet.env, then restart the service." >&2
-        exit 1
-      fi
-      app=#{(opt_libexec/"Keylet.app").to_s.shellescape}
-      actual=$(/usr/bin/shasum -a 256 "$app/Contents/MacOS/keylet")
-      if [[ "${actual%% *}" != "@BINARY_SHA256@" ]]; then
-        echo "Keylet binary differs from the signed release; refusing to start." >&2
-        exit 1
-      fi
-      /usr/bin/codesign --verify --strict "$app"
-      exec "$app/Contents/MacOS/keylet" agent --key "$key"
-    SH
-    chmod 0755, bin/"keylet-agent-service"
+    bin.install_symlink libexec/"Keylet.app/Contents/Resources/keylet-ssh-sign"
     # This helper is outside the sealed bundle and runs after linkage handling.
     (libexec/"keylet-verify-install").write <<~RUBY
       #!/usr/bin/ruby
@@ -49,6 +31,7 @@ class Keylet < Formula
         abort "Homebrew changed the signed Keylet binary. Do not re-sign it; restore the verified release."
       end
       system("/usr/bin/codesign", "--verify", "--strict", app) || abort("Keylet signature verification failed.")
+      exec File.join(app, "Contents/MacOS/keylet"), *ARGV unless ARGV.empty?
     RUBY
     chmod 0755, libexec/"keylet-verify-install"
   end
@@ -58,21 +41,9 @@ class Keylet < Formula
   end
 
   service do
-    run [opt_bin/"keylet-agent-service"]
+    run [opt_libexec/"keylet-verify-install", "agent"]
     keep_alive true
     process_type :background
-    throttle_interval 10
-  end
-
-  def caveats
-    <<~EOS
-      Requires Apple Silicon and macOS 26.4 or newer. No key is created by installation.
-      To start an approved existing key at user login, set KEYLET_KEY_ID=<uuid> in
-      $XDG_CONFIG_HOME/homebrew/services/keylet.env when XDG_CONFIG_HOME is set;
-      otherwise use $HOMEBREW_XDG_CONFIG_HOME/homebrew/services/keylet.env if set,
-      or ~/.homebrew/services/keylet.env. Then run brew services start keylet without sudo.
-      Stop the service before upgrades and restart it afterward. Keep the app bundle intact.
-    EOS
   end
 
   test do

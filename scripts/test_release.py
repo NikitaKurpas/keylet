@@ -108,7 +108,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('  version ', result)
         self.assertIn('if digest !=', result)
         self.assertIn('b'*64, result)
-        self.assertIn('KEYLET_KEY_ID', result)
+        self.assertNotIn('KEYLET_KEY_ID', result)
         self.assertNotIn('codesign --force', result)
         self.assertIn('Contents/MacOS/keylet', result)
         self.assertIn('depends_on arch: :arm64', result)

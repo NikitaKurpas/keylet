@@ -36,8 +36,8 @@ public enum SocketAgent {
       + "/Library/Containers/me.kurpas.keylet/Data/agent/socket.ssh"
   }
 
-  /// Serves one key until SIGINT/SIGTERM, then closes clients and removes its socket.
-  public static func run(path: String, store: KeyStore, id: UUID) throws {
+  /// Serves available keys until SIGINT/SIGTERM, optionally restricted to one UUID.
+  public static func run(path: String, store: KeyStore, id: UUID? = nil) throws {
     let audit = try AuditStore()
     try prepareEndpoint(path)
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -54,11 +54,9 @@ public enum SocketAgent {
     let signals = installSignalHandlers(listener: fd, stop: stop)
     defer { for source in signals { source.cancel() } }
     try serve(listener: fd, stop: stop) { request, peer in
-      let inventory = store.inventory()
-      let record = inventory.keys.first { $0.id == id }
-      return AuditedAgentProtocol.reply(to: request, key: record, peer: peer, audit: audit) {
-        data in
-        guard let record, record.policy != .userPresence else { throw AgentError.unavailable }
+      let keys = store.inventory().agentKeys(id: id)
+      return AuditedAgentProtocol.reply(to: request, keys: keys, peer: peer, audit: audit) {
+        data, record in
         return try store.sign(data, key: record)
       }
     }

@@ -10,6 +10,7 @@ class UnsignedBundleTests(unittest.TestCase):
         (root / 'licenses').mkdir()
         (root / 'licenses/swift-argument-parser-LICENSE.txt').write_bytes(b'public license fixture')
         (root / 'packaging/Info.plist').write_bytes(b'public plist fixture')
+        (root / 'packaging/keylet-ssh-sign').write_bytes(b'public signer fixture')
         for name in ['LICENSE', 'NOTICE.md', 'binary']:
             (root / name).write_bytes(b'public fixture')
         return root / 'binary'
@@ -21,6 +22,9 @@ class UnsignedBundleTests(unittest.TestCase):
             (retained / 'retained').write_bytes(b'unchanged signed fixture')
             out = bundle_unsigned.bundle(root, binary)
             self.assertEqual((out / 'Contents/MacOS/keylet').read_bytes(), binary.read_bytes())
+            helper = out / 'Contents/Resources/keylet-ssh-sign'
+            self.assertEqual(helper.read_bytes(), (root / 'packaging/keylet-ssh-sign').read_bytes())
+            self.assertEqual(helper.stat().st_mode & 0o777, 0o755)
             self.assertEqual((retained / 'retained').read_bytes(), b'unchanged signed fixture')
 
     def test_rejects_destination_symlink(self):

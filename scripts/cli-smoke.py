@@ -13,7 +13,7 @@ def run(args):
 code, doctor = run(['doctor'])
 assert code == 0 and doctor['offline'] and not doctor['credential_access_verified']
 for args in [['keys', 'public'], ['keys', 'public', '--id', 'bad'], ['keys', 'resolve'],
-             ['keys', 'resolve', '--label', ''], ['agent'], ['protocol', 'decode', '--hex', '']]:
+             ['keys', 'resolve', '--label', ''], ['agent', '--key', 'bad'], ['protocol', 'decode', '--hex', '']]:
     code, result = run(args)
     assert code == 1 and result['error']['code'] == 'invalid_arguments', (args, result)
     assert result['error']['message'] and 'help' in result['error']['message']

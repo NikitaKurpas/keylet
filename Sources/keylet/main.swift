@@ -212,14 +212,16 @@ struct Keys: ParsableCommand {
 
 struct Agent: ParsableCommand {
   static let configuration = CommandConfiguration(
-    abstract: "Serve one selected key in the foreground; no installation.")
-  @Option(help: "Key UUID.") var key: String
+    abstract: "Serve all unattended keys in the foreground.")
+  @Option(help: "Restrict the agent to one key UUID.") var key: String?
   @Option(help: "Absolute socket path in a user-owned 0700 directory.") var socket: String?
-  func validate() throws { _ = try validatedUUID(key) }
+  func validate() throws {
+    if let key { _ = try validatedUUID(key) }
+  }
   mutating func run() throws {
     let store = KeyStore(context: try SigningContext.current())
     try SocketAgent.run(
-      path: socket ?? SocketAgent.defaultSocket, store: store, id: validatedUUID(key))
+      path: socket ?? SocketAgent.defaultSocket, store: store, id: try key.map(validatedUUID))
   }
 }
 

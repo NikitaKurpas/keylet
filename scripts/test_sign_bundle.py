@@ -162,7 +162,19 @@ class SigningMetadataTests(unittest.TestCase):
             (app/'Contents/Resources/Licenses').mkdir()
             for path in [root/'licenses/swift-argument-parser-LICENSE.txt', app/'Contents/Resources/Licenses/swift-argument-parser-LICENSE.txt']:
                 path.write_text('public dependency notice fixture')
+            (root/'packaging').mkdir()
+            helper_source = root/'packaging/keylet-ssh-sign'
+            helper_source.write_bytes(b'public signer fixture')
+            helper = app/'Contents/Resources/keylet-ssh-sign'
+            helper.write_bytes(helper_source.read_bytes())
+            helper.chmod(0o755)
             signer.validate_bundle(root,app)
+            for contents, mode in [(b'changed signer', 0o755), (helper_source.read_bytes(), 0o644)]:
+                helper.write_bytes(contents)
+                helper.chmod(mode)
+                with self.assertRaisesRegex(ValueError,'keylet-ssh-sign'): signer.validate_bundle(root,app)
+            helper.write_bytes(helper_source.read_bytes())
+            helper.chmod(0o755)
             dependency_license = app/'Contents/Resources/Licenses/swift-argument-parser-LICENSE.txt'
             dependency_license.write_text('tampered public notice')
             with self.assertRaisesRegex(ValueError,'swift-argument-parser license'): signer.validate_bundle(root,app)
